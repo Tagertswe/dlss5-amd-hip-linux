@@ -47,28 +47,51 @@ struct Scratch {
   void create(){const size_t n=size_t(W+8)*(Ht+8)*32;a.alloc(n*4);b.alloc(n*4);bh.alloc(n*2);ah.alloc(n*2);d.alloc(n*4);q.alloc(n*12);q8.alloc(n*3);att8.alloc(n);hidden.alloc(640ull*4096*4);hidden8.alloc(640ull*4096);d8.alloc(n);f8.alloc(n);out8.alloc(n);a8.alloc(n);out16.alloc(n*2);a16.alloc(n*2);}
 };
 struct Block {
- uint c{},w{},h{},px{},py{},sw{},sh{};bool raw{},chain{};
- DeviceBuf fw,fs,ex,ct,p0,s0,qw,qs,bias,p1,s1;
- void create(const std::string&dir,int id,uint channels,uint width,uint height,uint shift,bool raw_output){
-  c=channels;w=width;h=height;px=(shift&1)?4:0;py=(shift&2)?4:0;sw=(w+px+7)&~7u;sh=(h+py+7)&~7u;raw=raw_output;
-  chain=c==32&&(id==2||id==3||id==4||id==67||id==68||id==69);
-  std::string p=id==70?"post70":"block"+std::to_string(id);size_t m=size_t(c)*c;
-  if(c==512){auto f=load(dir,p+"-ffwd",524288);fw=upload_tiled_e4m3(f.data(),512,512);
-   std::vector<u8> e(131072),t(131072);for(uint g=0;g<8;++g){pack_tiled_e4m3(e.data()+g*16384,f.data()+262144+g*16384,256,64);pack_tiled_e4m3(t.data()+g*16384,f.data()+393216+g*16384,64,256);}ex.alloc(e.size());ex.upload(e.data(),e.size());ct.alloc(t.size());ct.upload(t.data(),t.size());
-   auto fproj=load(dir,p+"-ffwd-projection",262656);p0=upload_tiled_e4m3(fproj.data(),c,c);s0=floats(fproj.data()+m,c);
-  }else {auto f=load(dir,p+"-ffn",c==32?8736:9*m+c);size_t off=c==32?512:0;
-   std::vector<u8> t(8*m);pack_tiled_e4m3(t.data(),f.data()+off,4*c,c);pack_tiled_e4m3(t.data()+4*m,f.data()+off+4*m,c,4*c);fw.alloc(t.size());fw.upload(t.data(),t.size());
-   if(c==32)fs=floats(f.data()+8704,32);else{p0=upload_tiled_e4m3(f.data()+8*m,c,c);s0=floats(f.data()+9*m,c);}
+  uint c{},w{},h{},px{},py{},sw{},sh{};bool raw{},chain{},windowed{};
+  DeviceBuf fw,fs,ex,ct,p0,s0,qw,qs,bias,p1,s1,ffn_rw,qw_rw,p1_rw;
+  void create(const std::string&dir,int id,uint channels,uint width,uint height,uint shift,bool raw_output){
+   c=channels;w=width;h=height;px=(shift&1)?4:0;py=(shift&2)?4:0;  sw=(w+px+7)&~7u;sh=(h+py+7)&~7u;raw=raw_output;windowed=(id!=0);
+   chain=c==32&&(id==2||id==3||id==4||id==67||id==68||id==69);
+   std::string p=id==70?"post70":"block"+std::to_string(id);size_t m=size_t(c)*c;
+   if(c==512){auto f=load(dir,p+"-ffwd",524288);fw=upload_tiled_e4m3(f.data(),512,512);
+    std::vector<u8> e(131072),t(131072);for(uint g=0;g<8;++g){pack_tiled_e4m3(e.data()+g*16384,f.data()+262144+g*16384,256,64);pack_tiled_e4m3(t.data()+g*16384,f.data()+393216+g*16384,64,256);}ex.alloc(e.size());ex.upload(e.data(),e.size());ct.alloc(t.size());ct.upload(t.data(),t.size());
+    auto fproj=load(dir,p+"-ffwd-projection",262656);p0=upload_tiled_e4m3(fproj.data(),c,c);s0=floats(fproj.data()+m,c);
+   }else {auto f=load(dir,p+"-ffn",c==32?8736:9*m+c);size_t off=c==32?512:0;
+    std::vector<u8> t(8*m);pack_tiled_e4m3(t.data(),f.data()+off,4*c,c);pack_tiled_e4m3(t.data()+4*m,f.data()+off+4*m,c,4*c);fw.alloc(t.size());fw.upload(t.data(),t.size());
+    if(c==32){
+     fs=floats(f.data()+8704,32);
+     std::vector<u8> rw(8192);
+     for(uint n=0;n<128;++n)for(uint k=0;k<32;++k)rw[n*32+k]=e4m3_byte(f[512+n*32+k]);
+     for(uint n=0;n<32;++n)for(uint k=0;k<128;++k)rw[4096+n*128+k]=e4m3_byte(f[4608+n*128+k]);
+     ffn_rw.alloc(rw.size());ffn_rw.upload(rw.data(),rw.size());
+    }else{p0=upload_tiled_e4m3(f.data()+8*m,c,c);s0=floats(f.data()+9*m,c);}
+   }
+   auto a=load(dir,p+"-attention",4*m+(c/32)*4096+c/32+c);
+   qw=upload_tiled_e4m3(a.data(),3*c,c);p1=upload_tiled_e4m3(a.data()+3*m,c,c);bias=floats(a.data()+4*m,(c/32)*4096);qs=floats(a.data()+4*m+(c/32)*4096,c/32);s1=floats(a.data()+4*m+(c/32)*4096+c/32,c);
+   if(c==32){
+    std::vector<u8> qr(3072),pr(1024);
+    for(uint n=0;n<96;++n)for(uint k=0;k<32;++k)qr[n*32+k]=e4m3_byte(a[n*32+k]);
+    for(uint n=0;n<32;++n)for(uint k=0;k<32;++k)pr[n*32+k]=e4m3_byte(a[3072+n*32+k]);
+    qw_rw.alloc(qr.size());qw_rw.upload(qr.data(),qr.size());
+    p1_rw.alloc(pr.size());p1_rw.upload(pr.data(),pr.size());
+   }
   }
-  auto a=load(dir,p+"-attention",4*m+(c/32)*4096+c/32+c);
-  qw=upload_tiled_e4m3(a.data(),3*c,c);p1=upload_tiled_e4m3(a.data()+3*m,c,c);bias=floats(a.data()+4*m,(c/32)*4096);qs=floats(a.data()+4*m+(c/32)*4096,c/32);s1=floats(a.data()+4*m+(c/32)*4096+c/32,c);
- }
  // The only physical activation format here is window-major [window][64][C].
  // Residuals remain distinct from quantized matrix operands.
   void window(const float* in,float* out,Scratch&s,const u8* in_f8=nullptr,bool emit_f8=false,
               const __half* in_h=nullptr,bool emit_h=false,bool write_f32_out=true){
-   uint n=sw*sh;float* f=s.b.as<float>();
-    if(c==512){
+    uint n=sw*sh;float* f=s.b.as<float>();
+      if(c==32 && in_h && !(std::getenv("DLSS5_C32_FUSED") && std::string(std::getenv("DLSS5_C32_FUSED")) == "0")){
+       const bool write_ffn = std::getenv("DLSS5_C32_FFN_OUT") &&
+                              std::string(std::getenv("DLSS5_C32_FFN_OUT")) != "0";
+       launch_c32_fused(in_h, fw.as<u8>(), fs.as<float>(), qw.as<u8>(), qs.as<float>(),
+                        bias.as<float>(), p1.as<u8>(), s1.as<float>(),
+                        write_ffn ? s.bh.as<__half>() : nullptr, s.ah.as<__half>(),
+                        s.out16.as<__half>(), w, h, sw, sh, px, py, chain, windowed,
+                        write_f32_out);
+       return;
+      }
+     if(c==512){
      if(in_h)launch_split_f32_hin_f8(in_h,fw.as<u8>(),ex.as<u8>(),ct.as<u8>(),s.d.as<float>(),s.d8.as<u8>(),n);
      else if(in_f8)launch_split_f32_f8in_f8(in_f8,fw.as<u8>(),ex.as<u8>(),ct.as<u8>(),s.d.as<float>(),s.d8.as<u8>(),n);
      else launch_split_f32_f8(in,fw.as<u8>(),ex.as<u8>(),ct.as<u8>(),s.d.as<float>(),s.d8.as<u8>(),n);
@@ -195,7 +218,7 @@ struct Network70::Impl {
   hip_check(hipMemcpyAsync(rgb.p,input,1920ull*1080*16,hipMemcpyHostToDevice,stream),"input upload");hip_check(hipEventRecord(ev0,stream),"start");
   launch_rgb_graph(rgb.as<float>(),color.as<float>(),tiles.as<float>(),W,1080,W,Ht);
   launch_prefix_h(tiles.as<float>(),prefix_w.as<float>(),host_history?history.as<float>():nullptr,s.a.as<float>(),s.a16.as<__half>(),seed,W,Ht,host_history?1:0);
-  blocks[0].window(s.a.as<float>(),s.a.as<float>(),s,nullptr,false,s.a16.as<__half>(),false);
+   blocks[0].window(s.a.as<float>(),s.a.as<float>(),s,nullptr,false,s.a16.as<__half>(),false);
    // Block 0 p1 writes H(v) in f16 (C32 path); crop from the f16 window raster.
    launch_reframe_f32_hin(s.ah.as<__half>(),skip[0].as<float>(),W,Ht,W,Ht,0,0,32,1,0);mark(0,skip[0].as<float>(),N*32);
   float* src=raster[0].as<float>();float* dst=raster[1].as<float>();
