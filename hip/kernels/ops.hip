@@ -422,7 +422,7 @@ __global__ void k_pool_f32(const float* src, float* dst, uint w, uint h, uint c,
 // True half operands for ViT QKV, decoder entry and pool/head matrices.
 // partitions reproduce the fast shader's independent K reductions; ordered
 // rounds after each K32 only for the head/DS reference path.
-template <bool HIN = false>
+template <bool HIN = false, bool DIRECT_OUT = false>
 __global__ void k_linear_half(const float* input,const __half* weights,float* output,
   uint m,uint n,uint k,uint partitions,int ordered,int raw,__half* output_h=nullptr) {
  using namespace linalg;
@@ -451,7 +451,9 @@ __global__ void k_linear_half(const float* input,const __half* weights,float* ou
       }
      }
      __syncthreads();
-    A16 a=A16::Load(tile,0,64);B16 b=B16::LoadRow(weights,((col/16)*(k/32)+g)*1024,32);
+    A16 a=A16::Load(tile,0,64);
+    B16 b = DIRECT_OUT ? B16::LoadRowMajorOut(weights, col, g * 32u, k)
+                       : B16::LoadRow(weights, ((col / 16) * (k / 32) + g) * 1024, 32);
     if(ordered){C32 p=Multiply(a,b);for(uint i=0;i<acc.Length();++i)acc.Set(i,H(acc.Get(i)+p.Get(i)));}
     else acc.MultiplyAccumulate(a,b);
    __syncthreads();

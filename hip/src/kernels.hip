@@ -605,6 +605,14 @@ void launch_linear_half_hin(const __half* in,const __half* w,float* out,__half* 
   if(!m||!n||!k||n%16||k%32||!parts||(k/32)%parts||!in||raw<0||raw>2)throw std::runtime_error("half linear f16-in geometry/alias");
   LAUNCH((k_linear_half<true>),dim3((m+15)/16,n/16),32,reinterpret_cast<const float*>(in),w,out,m,n,k,parts,ordered,raw,out_h);
 }
+void launch_linear_half_out(const float* in,const __half* w,float* out,uint m,uint n,uint k,uint parts,int ordered,int raw){
+  if(!m||!n||!k||n%16||k%32||!parts||(k/32)%parts||in==out||raw<0||raw>2)throw std::runtime_error("half linear out-major geometry/alias");
+  LAUNCH((k_linear_half<false,true>),dim3((m+15)/16,n/16),32,in,w,out,m,n,k,parts,ordered,raw);
+}
+void launch_linear_half_hin_out(const __half* in,const __half* w,float* out,__half* out_h,uint m,uint n,uint k,uint parts,int ordered,int raw){
+  if(!m||!n||!k||n%16||k%32||!parts||(k/32)%parts||!in||raw<0||raw>2)throw std::runtime_error("half linear f16-in out-major geometry/alias");
+  LAUNCH((k_linear_half<true,true>),dim3((m+15)/16,n/16),32,reinterpret_cast<const float*>(in),w,out,m,n,k,parts,ordered,raw,out_h);
+}
 void launch_split_f32(const float* in,const u8* pre,const u8* ex,const u8* ct,float* out,uint n){
   if(!n||in==out)throw std::runtime_error("split geometry/alias");LAUNCH((k_split_f32<false>),dim3((n+15)/16,8),128,in,pre,ex,ct,out,nullptr,n);
 }

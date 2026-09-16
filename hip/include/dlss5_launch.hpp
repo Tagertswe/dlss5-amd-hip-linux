@@ -136,6 +136,8 @@ hipStream_t get_launch_stream();
 void launch_linear_half(const float*,const __half*,float*,uint m,uint n,uint k,uint partitions,int ordered,int raw);
 void launch_linear_half_h(const float*,const __half*,float*,__half*,uint m,uint n,uint k,uint partitions,int ordered,int raw);
 void launch_linear_half_hin(const __half*,const __half*,float*,__half*,uint m,uint n,uint k,uint partitions,int ordered,int raw);
+void launch_linear_half_out(const float*,const __half*,float*,uint m,uint n,uint k,uint partitions,int ordered,int raw);
+void launch_linear_half_hin_out(const __half*,const __half*,float*,__half*,uint m,uint n,uint k,uint partitions,int ordered,int raw);
 void launch_split_f32(const float*,const u8*,const u8*,const u8*,float*,uint tokens);
 void launch_rgb_graph(const float*,float*,float*,uint w,uint h,uint ow,uint oh);
 void launch_gather_f32(const float*,const int*,float*,uint n);

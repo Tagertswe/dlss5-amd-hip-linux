@@ -27,9 +27,14 @@ std::vector<float> load(const std::string& dir,const std::string& name,size_t co
  return v;
 }
 DeviceBuf half_matrix(const float* v,uint n,uint k){
- std::vector<__half> t(size_t(n)*k);
- for(uint r=0;r<n;++r)for(uint c=0;c<k;++c)t[((r/16)*(k/32)+c/32)*512+(c%32)*16+r%16]=__float2half(v[size_t(r)*k+c]);
- DeviceBuf b(t.size()*2);b.upload(t.data(),t.size()*2);return b;
+  std::vector<__half> t(size_t(n)*k);
+  for(uint r=0;r<n;++r)for(uint c=0;c<k;++c)t[((r/16)*(k/32)+c/32)*512+(c%32)*16+r%16]=__float2half(v[size_t(r)*k+c]);
+  DeviceBuf b(t.size()*2);b.upload(t.data(),t.size()*2);return b;
+}
+DeviceBuf row_half_matrix(const float* v,uint n,uint k){
+  std::vector<__half> t(size_t(n)*k);
+  for(uint r=0;r<n;++r)for(uint c=0;c<k;++c)t[size_t(r)*k+c]=__float2half(v[size_t(r)*k+c]);
+  DeviceBuf b(t.size()*2);b.upload(t.data(),t.size()*2);return b;
 }
 std::vector<int> map_read(const std::string&p){
  std::ifstream f(p,std::ios::binary|std::ios::ate);if(!f||f.tellg()!=655360*4)throw std::runtime_error("map exact size: "+p);
@@ -125,7 +130,7 @@ struct Vit {
  void create(const std::string&dir,int id){std::string p="block"+std::to_string(id);
   auto e=load(dir,p+"-expand",4194304),c=load(dir,p+"-contract",4195328),q=load(dir,p+"-qkv",3145760),o=load(dir,p+"-projection",1049600);
   ex=upload_tiled_e4m3(e.data(),4096,1024);ct=upload_tiled_e4m3(c.data(),1024,4096);cs=floats(c.data()+4194304,1024);
-  qw=half_matrix(q.data(),3072,1024);qs=floats(q.data()+3145728,32);pw=upload_tiled_e4m3(o.data(),1024,1024);ps=floats(o.data()+1048576,1024);
+  qw=row_half_matrix(q.data(),3072,1024);qs=floats(q.data()+3145728,32);pw=upload_tiled_e4m3(o.data(),1024,1024);ps=floats(o.data()+1048576,1024);
  }
   void run(const float* in,float* out,Scratch&s){
    // The expand output is already on the E4M3 grid; keeping the bytes lets the
@@ -133,7 +138,7 @@ struct Vit {
    launch_linear_f32_f8out(in,ex.as<u8>(),s.hidden.as<float>(),s.hidden8.as<u8>(),640,4096,1024,nullptr,nullptr,2,0);
    launch_linear_f32_f8in(s.hidden8.as<u8>(),ct.as<u8>(),s.b.as<float>(),640,1024,4096,in,cs.as<float>(),1,2);
   // QKV fast fused uses genuine F16 weights, raw FP32 dot before normalization.
-  launch_linear_half(s.b.as<float>(),qw.as<__half>(),s.q.as<float>(),640,3072,1024,1,0,2);
+  launch_linear_half_out(s.b.as<float>(),qw.as<__half>(),s.q.as<float>(),640,3072,1024,1,0,2);
   launch_normalize_qkv(s.q.as<float>(),qs.as<float>(),s.q8.as<u8>(),640,1024,5.65625f);
    // The normalized QKV is already on the E4M3 grid, so attention can consume
    // the bytes directly; the f8 -> f32 round trip and re-quantize are redundant.
@@ -143,8 +148,8 @@ struct Vit {
 };
 struct Up {
  uint iw,ih,ow,oh,cin,cout;DeviceBuf wt,sc;
- void create(const std::string&dir,const std::string&name,uint w,uint h,uint width,uint height,uint ic,uint oc){iw=w;ih=h;ow=width;oh=height;cin=ic;cout=oc;auto v=load(dir,name,size_t(ic)*oc+oc);wt=half_matrix(v.data(),oc,ic);sc=floats(v.data()+size_t(ic)*oc,oc);}
-  void run(const float* in,const float* skip,float* out,Scratch&s,__half* out_h=nullptr){launch_linear_half(in,wt.as<__half>(),s.d.as<float>(),iw*ih,cout,cin,cin==1024?4:1,0,1);if(out_h)launch_up_f32_h(s.d.as<float>(),skip,sc.as<float>(),out,out_h,iw,ih,ow,oh,cout);else launch_up_f32(s.d.as<float>(),skip,sc.as<float>(),out,iw,ih,ow,oh,cout);}
+ void create(const std::string&dir,const std::string&name,uint w,uint h,uint width,uint height,uint ic,uint oc){iw=w;ih=h;ow=width;oh=height;cin=ic;cout=oc;auto v=load(dir,name,size_t(ic)*oc+oc);wt=row_half_matrix(v.data(),oc,ic);sc=floats(v.data()+size_t(ic)*oc,oc);}
+  void run(const float* in,const float* skip,float* out,Scratch&s,__half* out_h=nullptr){launch_linear_half_out(in,wt.as<__half>(),s.d.as<float>(),iw*ih,cout,cin,cin==1024?4:1,0,1);if(out_h)launch_up_f32_h(s.d.as<float>(),skip,sc.as<float>(),out,out_h,iw,ih,ow,oh,cout);else launch_up_f32(s.d.as<float>(),skip,sc.as<float>(),out,iw,ih,ow,oh,cout);}
 };
 }
 struct Network70::Impl {
@@ -168,8 +173,8 @@ struct Network70::Impl {
   group(62,4,64,480,288,false);group(66,4,32,960,576,false);blocks[70].create(dir,70,32,W,Ht,3,true);
   for(int i=0;i<8;++i)vit[i].create(dir,31+i);
   auto prefix=load(dir,"block0-ffn",8736);prefix_w=floats(prefix.data(),512);
-  int ids[]={4,8,14,22};for(int i=0;i<4;++i){uint c=32u<<i;auto v=load(dir,"block"+std::to_string(ids[i])+"-ds",2ull*c*c);ds[i]=half_matrix(v.data(),2*c,c);}
-  auto hm=load(dir,"head-matrix",524288);head_w=half_matrix(hm.data(),1024,512);
+  int ids[]={4,8,14,22};for(int i=0;i<4;++i){uint c=32u<<i;auto v=load(dir,"block"+std::to_string(ids[i])+"-ds",2ull*c*c);ds[i]=row_half_matrix(v.data(),2*c,c);}
+  auto hm=load(dir,"head-matrix",524288);head_w=row_half_matrix(hm.data(),1024,512);
   auto sc=load(dir,"post70-scales",64),hw=load(dir,"post70-head",96);post_sc=floats(sc.data(),64);head_rgb=floats(hw.data(),96);
   up[0].create(dir,"decoder39-weights",32,20,60,36,1024,512);up[1].create(dir,"block48-weights",60,36,120,72,512,256);up[2].create(dir,"block56-weights",120,72,240,144,256,128);up[3].create(dir,"block62-weights",240,144,480,288,128,64);up[4].create(dir,"block66-weights",480,288,960,576,64,32);
   rgb.alloc(1920ull*1080*16);color.alloc(size_t(N)*16);tiles.alloc(size_t(N)*16);out.alloc(size_t(N)*12);
@@ -202,8 +207,8 @@ struct Network70::Impl {
    for(int j=0;j<num[g];++j){int id=first[g]+j;auto&b=blocks[id];bool emit_f8=!b.raw&&b.c>=64;bool emit_h=b.c==32;bool write_f32=tracing||j+1==num[g];b.run(src,dst,s,in_f8,emit_f8,in_h,emit_h,write_f32,false);std::swap(src,dst);mark(id,src,w*h*c);in_f8=emit_f8?s.out8.as<u8>():nullptr;in_h=emit_h?s.out16.as<__half>():nullptr;}
    hip_check(hipMemcpyAsync(skip[g+1].p,src,size_t(w)*h*c*4,hipMemcpyDeviceToDevice,stream),"encoder skip");
     uint ow=g==4?32:w/2,oh=g==4?20:h/2;
-     if(g<4){launch_pool_f32_h(src,nullptr,s.a16.as<__half>(),w,h,c,ow,oh);launch_linear_half_hin(s.a16.as<__half>(),ds[g].as<__half>(),nullptr,s.out16.as<__half>(),ow*oh,c*2,c,1,1,0);}
-     else{launch_pool_f32_h(src,nullptr,s.a16.as<__half>(),w,h,c,ow,oh);launch_linear_half_hin(s.a16.as<__half>(),head_w.as<__half>(),dst,nullptr,ow*oh,c*2,c,1,1,0);}
+     if(g<4){launch_pool_f32_h(src,nullptr,s.a16.as<__half>(),w,h,c,ow,oh);launch_linear_half_hin_out(s.a16.as<__half>(),ds[g].as<__half>(),nullptr,s.out16.as<__half>(),ow*oh,c*2,c,1,1,0);}
+     else{launch_pool_f32_h(src,nullptr,s.a16.as<__half>(),w,h,c,ow,oh);launch_linear_half_hin_out(s.a16.as<__half>(),head_w.as<__half>(),dst,nullptr,ow*oh,c*2,c,1,1,0);}
     group_in_h=g<4?s.out16.as<__half>():nullptr;
     std::swap(src,dst);w=ow;h=oh;c*=2;
   }

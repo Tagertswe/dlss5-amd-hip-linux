@@ -60,6 +60,20 @@ struct MatrixB {
         return b;
     }
     template <typename Ptr>
+    __device__ static MatrixB LoadRowMajorOut(Ptr buf, uint out_col, uint k0, uint k_stride) {
+        const DataT* base = reinterpret_cast<const DataT*>(buf) +
+            (size_t)(out_col + (threadIdx.x & 15u)) * k_stride + k0 + ((threadIdx.x >> 4u) & 1u) * 8u;
+        MatrixB b;
+        b.row = true;
+#pragma unroll
+        for (uint e = 0; e < 8u; ++e)
+            b.k0r[e] = base[e];
+#pragma unroll
+        for (uint e = 0; e < 8u; ++e)
+            b.k1r[e] = base[e + 16u];
+        return b;
+    }
+    template <typename Ptr>
     __device__ static MatrixB LoadCol(Ptr buf, uint byte_off, uint stride_bytes) {
         const DataT* p = reinterpret_cast<const DataT*>(
             reinterpret_cast<const char*>(buf) + byte_off);
