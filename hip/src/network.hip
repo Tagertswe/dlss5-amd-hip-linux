@@ -84,8 +84,8 @@ struct Block {
       if(c==32 && in_h && !(std::getenv("DLSS5_C32_FUSED") && std::string(std::getenv("DLSS5_C32_FUSED")) == "0")){
        const bool write_ffn = std::getenv("DLSS5_C32_FFN_OUT") &&
                               std::string(std::getenv("DLSS5_C32_FFN_OUT")) != "0";
-       launch_c32_fused(in_h, fw.as<u8>(), fs.as<float>(), qw.as<u8>(), qs.as<float>(),
-                        bias.as<float>(), p1.as<u8>(), s1.as<float>(),
+        launch_c32_fused(in_h, ffn_rw.as<u8>(), fs.as<float>(), qw_rw.as<u8>(), qs.as<float>(),
+                         bias.as<float>(), p1_rw.as<u8>(), s1.as<float>(),
                         write_ffn ? s.bh.as<__half>() : nullptr, s.ah.as<__half>(),
                         s.out16.as<__half>(), w, h, sw, sh, px, py, chain, windowed,
                         write_f32_out);

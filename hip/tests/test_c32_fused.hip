@@ -95,8 +95,8 @@ int main() {
                                                 out_raster_ref.as<__half>(), tokens, 32, 32,
                                                 ffn_ref.as<__half>(), proj_s_d.as<float>(), 4, 0, false,
                                                 rw, rh, rsw, rpx, rpy);
-        launch_c32_fused(in_d.as<__half>(), ffn_w.as<u8>(), ffn_s_d.as<float>(), qkv_w.as<u8>(),
-                         qs_d.as<float>(), bias_d.as<float>(), proj_w.as<u8>(), proj_s_d.as<float>(),
+        launch_c32_fused(in_d.as<__half>(), ffn_rw_d.as<u8>(), ffn_s_d.as<float>(), qkv_rw_d.as<u8>(),
+                          qs_d.as<float>(), bias_d.as<float>(), proj_rw_d.as<u8>(), proj_s_d.as<float>(),
                          ffn_fus.as<__half>(), out_fus.as<__half>(), out_raster_fus.as<__half>(),
                          rw, rh, rsw, rsh, rpx, rpy, chain, true);
 
