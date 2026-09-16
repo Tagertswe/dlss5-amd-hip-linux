@@ -207,11 +207,30 @@ __global__ void k_ffn_f32(const float* input, const u8* weights, const float* sc
     __syncthreads();
     if (group < GROUPS) {
         const uint t0 = group * 16;
-        for (uint n = 0; n < 4; ++n) {
+        for (uint n = 0; n < 4; ++n)
             for (uint i = 0; i < ex[n].Length(); ++i) ex[n].Set(i,
                 C == 32 && precise_c32 ? ActivatePolyC32(ex[n].Get(i))
                                        : ActivatePoly(ex[n].Get(i)));
-            ex[n].StoreF8(hidden + t0 * hidden_c, (sub * 4 + n) * 16, hidden_c);
+        if constexpr (C == 32) {
+            const uint lane = threadIdx.x & 31u;
+            const uint row0 = (lane >= 16u ? 8u : 0u);
+            const uint base = lane & ~3u;
+            const uint col0 = (lane & 15u) & ~3u;
+            for (uint n = 0; n < 4; ++n) {
+                const uint hcol = (sub * 4u + n) * 16u + col0;
+                for (uint i = 0; i < 8u; ++i) {
+                    uint b0 = e4m3_byte(ex[n].Get(i));
+                    uint b1 = __shfl(b0, base + 1u);
+                    uint b2 = __shfl(b0, base + 2u);
+                    uint b3 = __shfl(b0, base + 3u);
+                    if ((lane & 3u) == 0u)
+                        *reinterpret_cast<u32*>(hidden + (t0 + row0 + i) * hidden_c + hcol) =
+                            b0 | b1 << 8 | b2 << 16 | b3 << 24;
+                }
+            }
+        } else {
+            for (uint n = 0; n < 4; ++n)
+                ex[n].StoreF8(hidden + t0 * hidden_c, (sub * 4 + n) * 16, hidden_c);
         }
     }
     __syncthreads();
