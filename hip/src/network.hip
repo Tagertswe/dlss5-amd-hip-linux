@@ -81,7 +81,7 @@ struct Block {
   void window(const float* in,float* out,Scratch&s,const u8* in_f8=nullptr,bool emit_f8=false,
               const __half* in_h=nullptr,bool emit_h=false,bool write_f32_out=true){
     uint n=sw*sh;float* f=s.b.as<float>();
-      if(c==32 && in_h && !(std::getenv("DLSS5_C32_FUSED") && std::string(std::getenv("DLSS5_C32_FUSED")) == "0")){
+      if(c==32 && in_h && std::getenv("DLSS5_C32_FUSED") && std::string(std::getenv("DLSS5_C32_FUSED")) == "1"){
        const bool write_ffn = std::getenv("DLSS5_C32_FFN_OUT") &&
                               std::string(std::getenv("DLSS5_C32_FFN_OUT")) != "0";
         launch_c32_fused(in_h, ffn_rw.as<u8>(), fs.as<float>(), qw_rw.as<u8>(), qs.as<float>(),
