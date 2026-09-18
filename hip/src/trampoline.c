@@ -122,6 +122,15 @@ EXPORT int dlss5_run_frame(const Dlss5Frame *frame) {
     return ((int SYSV (*)(const Dlss5Frame *))g_frame->run_frame)(frame);
 }
 
+EXPORT int dlss5_run_frame_raw_gpu(const Dlss5FrameRaw *frame) {
+    local_error = 0;
+    if (!g_frame || g_frame->magic != DLSS5_HIP_FRAME_MAGIC || !g_frame->run_frame_raw_gpu) {
+        local_error = "hip raw gpu bridge missing (rebuild and preload the matching V3 library)";
+        return -1;
+    }
+    return ((int SYSV (*)(const Dlss5FrameRaw *))g_frame->run_frame_raw_gpu)(frame);
+}
+
 EXPORT int dlss5_find_device(const char *name) {
     local_error = 0;
     if (!g_device || g_device->magic != DLSS5_HIP_DEVICE_MAGIC || !g_device->find_device) {

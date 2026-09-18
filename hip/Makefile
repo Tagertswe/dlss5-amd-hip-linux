@@ -44,6 +44,10 @@ $(BUILD)/network.o: src/network.hip include/*.hpp Makefile
 	mkdir -p $(BUILD)
 	$(HIPCC) $(CXXFLAGS) -fPIC -c src/network.hip -o $@
 
+$(BUILD)/gpu_interop.o: src/gpu_interop.hip include/*.hpp include/*.h kernels/gpu_convert.hip Makefile
+	mkdir -p $(BUILD)
+	$(HIPCC) $(CXXFLAGS) -fPIC -c $< -o $@
+
 $(BUILD)/%.o: src/%.hip include/*.hpp include/*.h Makefile
 	mkdir -p $(BUILD)
 	$(HIPCC) $(CXXFLAGS) -fPIC -c $< -o $@
@@ -55,7 +59,7 @@ $(filter-out test_wmma,$(TESTS)): %: tests/%.hip $(BUILD)/kernels.o $(BUILD)/ker
 hip-network70: $(BUILD)/bench.o $(BUILD)/kernels.o $(BUILD)/kernels_prod.o $(BUILD)/kernels_mh1.o $(BUILD)/kernels_mh2.o $(BUILD)/network.o
 	$(HIPCC) $(CXXFLAGS) $^ $(LDFLAGS) -o $@
 
-libdlss5_hip.so: $(BUILD)/capi.o $(BUILD)/frame.o $(BUILD)/kernels.o $(BUILD)/kernels_prod.o $(BUILD)/kernels_mh1.o $(BUILD)/kernels_mh2.o $(BUILD)/network.o
+libdlss5_hip.so: $(BUILD)/capi.o $(BUILD)/frame.o $(BUILD)/kernels.o $(BUILD)/kernels_prod.o $(BUILD)/kernels_mh1.o $(BUILD)/kernels_mh2.o $(BUILD)/network.o $(BUILD)/gpu_interop.o
 	$(HIPCC) $(CXXFLAGS) -shared -fPIC $^ $(LDFLAGS) -o $@
 
 dlss5_hip.dll: src/trampoline.c include/dlss5_capi.h

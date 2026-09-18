@@ -54,11 +54,32 @@ typedef struct Dlss5Frame {
     dlss5_u32 seed, reset;
     float paper_white, transfer, color;
 } Dlss5Frame;
+/* V3 raw GPU-resident frame: in_handle/out_handle are Win32 D3D12 shared handles of
+   DEFAULT-heap linear buffers holding the packed game pixels (w x h x bytes-per-pixel),
+   or raw device pointers when flags bit1 is set (offline use). The whole pipeline
+   (pixel->RGBA, encode, network, decode, RGB->pixel) runs on the GPU. Output semantics
+   match the CPU path exactly: RGB channels replaced, alpha bytes bit-exact from
+   dev_in. On bypass (non-finite or non-representable frame) dev_out is a copy of
+   dev_in and the call still returns 0. */
+#define DLSS5_HIP_RAW_FLAGS_SRGB 1u
+#define DLSS5_HIP_RAW_FLAGS_DEV_PTRS 2u
+typedef struct Dlss5FrameRaw {
+    dlss5_u32 struct_size;
+    void *in_handle;
+    void *out_handle;
+    dlss5_u32 width, height;
+    dlss5_u32 dxgi_format; /* 28 RGBA8, 87 BGRA8, 11 R16 UNORM, 10 RGBA16 FLOAT */
+    dlss5_u32 seed;
+    dlss5_u32 flags;
+    float paper_white, transfer, color;
+} Dlss5FrameRaw;
 typedef struct Dlss5HipFrameBridge {
     unsigned long long magic;
     int (*run_frame)(const Dlss5Frame *frame);
+    int (*run_frame_raw_gpu)(const Dlss5FrameRaw *frame);
 } Dlss5HipFrameBridge;
 DLSS5_CAPI_EXPORT int dlss5_run_frame(const Dlss5Frame *frame);
+DLSS5_CAPI_EXPORT int dlss5_run_frame_raw_gpu(const Dlss5FrameRaw *frame);
 
 #define DLSS5_HIP_DEVICE_MAGIC 0x3349504853534C44ULL
 #define DLSS5_HIP_DEVICE_ENV "DLSS5_HIP_DEVICE_BRIDGE"

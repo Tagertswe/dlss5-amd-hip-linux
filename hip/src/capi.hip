@@ -2,6 +2,7 @@
 #include "dlss5_network.hpp"
 #include "dlss5_launch.hpp"
 #include "dlss5_frame.hpp"
+#include "dlss5_gpu_interop.hpp"
 #include <mutex>
 #include <string>
 #include <cstdio>
@@ -55,7 +56,9 @@ struct FrameBuffers {
     float previous_white=0;
     void create() {
         const size_t n=1920ull*1080, padded=1920ull*1152;
-        source.alloc(n*16);proxy.alloc(n*16);neural.alloc(n*12);decoded.alloc(n*12);history.alloc(n*12);
+        // neural must hold the network's full 1920x1152 RGB output; only the first
+        // 1920x1080 rows are consumed (same as the CPU path's first n*12 bytes).
+        source.alloc(n*16);proxy.alloc(n*16);neural.alloc(padded*12);decoded.alloc(n*12);history.alloc(n*12);
         warped.alloc(padded*16);base.alloc(padded*16);
         host_proxy.resize(n*4);host_neural.resize(padded*3);host_warped.resize(padded*4);host_result.resize(n*3);
     }
@@ -283,6 +286,63 @@ extern "C" int dlss5_run_frame_gpu(const float* dev_in, float* dev_out, uint32_t
     } catch(const std::exception&e) {if(g_frame)g_frame->history_valid=false;set_err(e.what());return -1;}
 }
 
+// V3 raw GPU-resident frame: packed game pixels arrive as Win32 D3D12 shared handles
+// (or raw device pointers, flags bit1). convert->encode->network->decode->convert all
+// run on the GPU; no host round-trip. Output semantics match the CPU path bit-for-bit
+// (RGB replaced, alpha preserved from dev_in; bypass = dev_out <- dev_in copy).
+extern "C" int dlss5_run_frame_raw_gpu(const Dlss5FrameRaw* f) {
+    std::lock_guard<std::mutex> lock(g_mu);
+    if (!g_net) return set_err("not initialized"), -1;
+    if (!f || f->struct_size != sizeof(Dlss5FrameRaw) || (f->flags & ~0x3u) ||
+        !(f->flags & DLSS5_HIP_RAW_FLAGS_DEV_PTRS) && (!f->in_handle || !f->out_handle) ||
+        f->width < 1 || f->height < 1 || f->width > 7680 || f->height > 4320 ||
+        dlss5::gpu::format_from_dxgi(f->dxgi_format) == dlss5::gpu::FmtUnsupported)
+        return set_err("invalid raw frame ABI/buffers"), -1;
+    try {
+        FrameTimer ft;
+        const size_t n=1920ull*1080;
+        dlss5::hip_check(hipSetDevice(g_gpu),"raw frame device");
+        if (!g_frame) {auto next=std::make_unique<FrameBuffers>();next->create();g_frame=std::move(next);}
+        auto& b=*g_frame;
+        const bool dev_ptrs=(f->flags & DLSS5_HIP_RAW_FLAGS_DEV_PTRS)!=0;
+        const size_t bytes=size_t(f->width)*f->height*((f->dxgi_format==28||f->dxgi_format==87)?4u:8u);
+        void* dev_in=nullptr,* dev_out=nullptr;
+        if (dev_ptrs) {dev_in=f->in_handle;dev_out=f->out_handle;}
+        else {
+            if (!dlss5::gpu::map_device(f->in_handle,bytes,&dev_in)) throw std::runtime_error("cannot import input handle");
+            if (!dlss5::gpu::map_device(f->out_handle,bytes,&dev_out)) throw std::runtime_error("cannot import output handle");
+        }
+        const auto fmt=dlss5::gpu::format_from_dxgi(f->dxgi_format);
+        auto bypass=[&]() {
+            // CPU bypass semantics: keep the original pixels, alpha exact.
+            dlss5::hip_check(hipMemcpy(dev_out,dev_in,bytes,hipMemcpyDeviceToDevice),"bypass copy");
+            dlss5::hip_check(hipStreamSynchronize(nullptr),"bypass sync");
+            g_err.clear();return 0;
+        };
+        b.history_valid=false;b.previous_flags=f->flags&1u;b.previous_white=f->paper_white;
+        dlss5::FrameSettings settings{f->paper_white,f->transfer,f->color,(f->flags&1u)!=0};
+        if (fmt==dlss5::gpu::FmtRgba16F && dlss5::gpu::input16_bad((const uint8_t*)dev_in,size_t(f->width)*f->height*4))
+            return bypass();
+        dlss5::gpu::launch_px_to_rgba((const uint8_t*)dev_in,b.source.as<float>(),f->width,f->height,f->dxgi_format);
+        ft.mark("conv_in");
+        dlss5::frame_encode(b.source.as<float>(),b.proxy.as<float>(),1920,1080,settings,nullptr);
+        ft.mark("encode");
+        g_net->run_gpu_gpu(b.proxy.as<float>(),b.neural.as<float>(),f->seed,nullptr);
+        ft.mark("net");
+        dlss5::frame_decode(b.source.as<float>(),b.proxy.as<float>(),b.neural.as<float>(),b.decoded.as<float>(),1920,1080,settings,nullptr);
+        ft.mark("decode");
+        dlss5::hip_check(hipStreamSynchronize(nullptr),"raw frame gpu");
+        ft.mark("sync");
+        if (dlss5::gpu::guard_result_f32(b.decoded.as<float>(),n*3,fmt==dlss5::gpu::FmtRgba16F))
+            return bypass();
+        dlss5::gpu::launch_rgb_to_pix(b.decoded.as<float>(),(const uint8_t*)dev_in,(uint8_t*)dev_out,f->width,f->height,f->dxgi_format);
+        ft.mark("conv_out");
+        dlss5::hip_check(hipStreamSynchronize(nullptr),"raw frame out");
+        ft.mark("sync_out");
+        g_err.clear();return 0;
+    } catch(const std::exception&e) {set_err(e.what());return -1;}
+}
+
 __attribute__((constructor)) static void dlss5_hip_publish(void) {
     memset(&g_bridge, 0, sizeof(g_bridge));
     g_bridge.magic = DLSS5_HIP_MAGIC;
@@ -297,6 +357,7 @@ __attribute__((constructor)) static void dlss5_hip_publish(void) {
         (void)unsetenv(DLSS5_HIP_ENV);
     }
     g_frame_bridge.magic=DLSS5_HIP_FRAME_MAGIC;g_frame_bridge.run_frame=dlss5_run_frame;
+    g_frame_bridge.run_frame_raw_gpu=dlss5_run_frame_raw_gpu;
     snprintf(buf,sizeof(buf),"%p",(void*)&g_frame_bridge);
     if(setenv(DLSS5_HIP_FRAME_ENV,buf,1)!=0){g_frame_bridge.magic=0;(void)unsetenv(DLSS5_HIP_FRAME_ENV);}
     g_device_bridge.magic=DLSS5_HIP_DEVICE_MAGIC;g_device_bridge.find_device=dlss5_find_device;
