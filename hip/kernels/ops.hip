@@ -132,7 +132,8 @@ template <int C, bool F8OUT = false, int GROUPS = 1, bool HOUT = false, bool F8I
 __global__ void k_ffn_f32(const float* input, const u8* weights, const float* scales,
                           float* output, u8* output_f8, uint tokens, bool chain_residual = false,
                           bool precise_c32 = false, __half* output_h = nullptr,
-                          const u8* input_f8 = nullptr, const __half* input_h = nullptr) {
+                           const u8* input_f8 = nullptr, const __half* input_h = nullptr,
+                           u8* dbg_hidden = nullptr, float* dbg_ex = nullptr) {
     using namespace linalg;
     constexpr uint hidden_c = 4 * C;
     constexpr uint WAVES_PER_GROUP = C / 16;
@@ -201,6 +202,12 @@ __global__ void k_ffn_f32(const float* input, const u8* weights, const float* sc
                 ex[n].MultiplyAccumulate(a, b);
             }
         }
+        if (dbg_ex)
+            for (uint n = 0; n < 4; ++n)
+                for (uint i = 0; i < ex[n].Length(); ++i) {
+                    uint2 c2 = ex[n].GetCoordinate(i);
+                    dbg_ex[(first + t0 + c2.x) * hidden_c + (sub * 4 + n) * 16 + c2.y] = ex[n].Get(i);
+                }
     }
     // The hidden buffer aliases the input staging; every group must finish
     // reading its input tile before any group overwrites it with hidden bytes.
@@ -231,6 +238,13 @@ __global__ void k_ffn_f32(const float* input, const u8* weights, const float* sc
         } else {
             for (uint n = 0; n < 4; ++n)
                 ex[n].StoreF8(hidden + t0 * hidden_c, (sub * 4 + n) * 16, hidden_c);
+            if (dbg_hidden)
+                for (uint n = 0; n < 4; ++n)
+                    for (uint i = 0; i < ex[n].Length(); ++i) {
+                        uint2 c2 = ex[n].GetCoordinate(i);
+                        dbg_hidden[(first + t0 + c2.x) * hidden_c + (sub * 4 + n) * 16 + c2.y] =
+                            e4m3_byte(ex[n].Get(i));
+                    }
         }
     }
     __syncthreads();

@@ -13,9 +13,9 @@ MINGW_CC ?= $(firstword $(wildcard \
 
 .PHONY: all clean test game test-api bench-ffn32
 
-bench-ffn32: tests/bench_ffn32.hip $(BUILD)/kernels.o include/*.hpp
+bench-ffn32: tests/bench_ffn32.hip $(BUILD)/kernels.o $(BUILD)/kernels_prod.o $(BUILD)/kernels_mh1.o $(BUILD)/kernels_mh2.o include/*.hpp
 	$(HIPCC) $(CXXFLAGS) -c tests/bench_ffn32.hip -o $(BUILD)/bench_ffn32.o
-	$(HIPCC) $(CXXFLAGS) $(BUILD)/bench_ffn32.o $(BUILD)/kernels.o $(LDFLAGS) -o $@
+	$(HIPCC) $(CXXFLAGS) $(BUILD)/bench_ffn32.o $(BUILD)/kernels.o $(BUILD)/kernels_prod.o $(BUILD)/kernels_mh1.o $(BUILD)/kernels_mh2.o $(LDFLAGS) -o $@
 
 all: $(TESTS) hip-network70 libdlss5_hip.so
 
@@ -28,6 +28,18 @@ $(BUILD)/kernels.o: src/kernels.hip include/*.hpp kernels/*.hip Makefile
 	mkdir -p $(BUILD)
 	$(HIPCC) $(CXXFLAGS) -fPIC -c src/kernels.hip -o $@
 
+$(BUILD)/kernels_prod.o: src/kernels_prod.hip include/*.hpp kernels/c32_prod.hip Makefile
+	mkdir -p $(BUILD)
+	$(HIPCC) $(CXXFLAGS) -fPIC -DHIP_PREPACKED_WEIGHTS -c src/kernels_prod.hip -o $@
+
+$(BUILD)/kernels_mh1.o: src/kernels_mh1.hip include/*.hpp kernels/mh_prod1.hip Makefile
+	mkdir -p $(BUILD)
+	$(HIPCC) $(CXXFLAGS) -fPIC -c src/kernels_mh1.hip -o $@
+
+$(BUILD)/kernels_mh2.o: src/kernels_mh2.hip include/*.hpp kernels/mh_prod2.hip Makefile
+	mkdir -p $(BUILD)
+	$(HIPCC) $(CXXFLAGS) -fPIC -c src/kernels_mh2.hip -o $@
+
 $(BUILD)/network.o: src/network.hip include/*.hpp Makefile
 	mkdir -p $(BUILD)
 	$(HIPCC) $(CXXFLAGS) -fPIC -c src/network.hip -o $@
@@ -36,14 +48,14 @@ $(BUILD)/%.o: src/%.hip include/*.hpp include/*.h Makefile
 	mkdir -p $(BUILD)
 	$(HIPCC) $(CXXFLAGS) -fPIC -c $< -o $@
 
-$(filter-out test_wmma,$(TESTS)): %: tests/%.hip $(BUILD)/kernels.o include/*.hpp
+$(filter-out test_wmma,$(TESTS)): %: tests/%.hip $(BUILD)/kernels.o $(BUILD)/kernels_prod.o $(BUILD)/kernels_mh1.o $(BUILD)/kernels_mh2.o include/*.hpp
 	$(HIPCC) $(CXXFLAGS) -c $< -o $(BUILD)/$@.o
-	$(HIPCC) $(CXXFLAGS) $(BUILD)/$@.o $(BUILD)/kernels.o $(LDFLAGS) -o $@
+	$(HIPCC) $(CXXFLAGS) $(BUILD)/$@.o $(BUILD)/kernels.o $(BUILD)/kernels_prod.o $(BUILD)/kernels_mh1.o $(BUILD)/kernels_mh2.o $(LDFLAGS) -o $@
 
-hip-network70: $(BUILD)/bench.o $(BUILD)/kernels.o $(BUILD)/network.o
+hip-network70: $(BUILD)/bench.o $(BUILD)/kernels.o $(BUILD)/kernels_prod.o $(BUILD)/kernels_mh1.o $(BUILD)/kernels_mh2.o $(BUILD)/network.o
 	$(HIPCC) $(CXXFLAGS) $^ $(LDFLAGS) -o $@
 
-libdlss5_hip.so: $(BUILD)/capi.o $(BUILD)/frame.o $(BUILD)/kernels.o $(BUILD)/network.o
+libdlss5_hip.so: $(BUILD)/capi.o $(BUILD)/frame.o $(BUILD)/kernels.o $(BUILD)/kernels_prod.o $(BUILD)/kernels_mh1.o $(BUILD)/kernels_mh2.o $(BUILD)/network.o
 	$(HIPCC) $(CXXFLAGS) -shared -fPIC $^ $(LDFLAGS) -o $@
 
 dlss5_hip.dll: src/trampoline.c include/dlss5_capi.h

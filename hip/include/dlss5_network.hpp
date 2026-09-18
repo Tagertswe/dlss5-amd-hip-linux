@@ -18,6 +18,17 @@ struct Network70 {
     // Optional already-warped/reflected 1920x1152 raster RGBA F32 history.
     // nullptr disables history for this call; no history is implicitly retained.
     void run(const float* host_rgb, float* host_out, uint seed, const float* host_history = nullptr);
+    // GPU-resident input variant: dev_rgb is a DEVICE pointer to the 1920x1080 RGBA
+    // proxy (e.g. the frame_encode output). Skips the H2D input upload and reads the
+    // buffer directly. host_out/host_history remain host pointers. Produces
+    // bit-identical output to run() for the same input bytes (the upload/download are
+    // raw bit-preserving copies).
+    void run_gpu(const float* dev_rgb, float* host_out, uint seed, const float* host_history = nullptr);
+    // Fully GPU-resident variant: dev_rgb is a DEVICE pointer to the 1920x1080 RGBA
+    // proxy and dev_out is a DEVICE pointer that receives the N*12 float output.
+    // No H2D input upload and no D2H output download: the network stays on the GPU.
+    // Bit-identical to run_gpu() for the same input bytes.
+    void run_gpu_gpu(const float* dev_rgb, float* dev_out, uint seed, const float* host_history = nullptr);
     float last_gpu_ms() const;
     struct Trace { uint elements{}, nonfinite{}, hash{}; float minimum{}, maximum{}; double sum{}; bool checked{}; };
     std::array<uint,71> last_block_counts() const;

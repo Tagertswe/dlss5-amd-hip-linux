@@ -10,9 +10,38 @@
 #include <cmath>
 #include <vector>
 #include <memory>
+#include <chrono>
 
 static std::mutex g_mu;
 static dlss5::Network70* g_net;
+
+namespace {
+struct FrameTimer {
+    bool on=false;
+    std::vector<std::pair<std::string,double>> marks;
+    double t0=0;
+    FrameTimer() {
+        const char* e=getenv("DLSS5_FRAME_TIMING");
+        on=e&&std::string(e)!="0";
+        if(on)t0=now();
+    }
+    static double now(){return std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now().time_since_epoch()).count();}
+    void mark(const char* name){if(!on)return;marks.emplace_back(name,now());}
+    ~FrameTimer(){
+        if(!on)return;
+        FILE* fp=fopen("/tmp/dlss5_frame_timing.log","a");
+        if(!fp)return;
+        double prev=t0;
+        double total=now()-t0;
+        fprintf(fp,"frame total=%.2fms |",total);
+        for(auto&m:marks){double dt=m.second-prev;fprintf(fp," %s=%.2f",m.first.c_str(),dt);prev=m.second;}
+        if(g_net)fprintf(fp," net_gpu=%.2f",g_net->last_gpu_ms());
+        fprintf(fp,"\n");
+        fclose(fp);
+    }
+};
+}
+
 static thread_local std::string g_err;
 static Dlss5HipBridge g_bridge;
 static Dlss5HipFrameBridge g_frame_bridge;
@@ -159,6 +188,7 @@ extern "C" int dlss5_run_frame(const Dlss5Frame* f) {
         return set_err("invalid frame ABI/buffers"), -1;
     }
     try {
+        FrameTimer ft;
         const size_t n=1920ull*1080;
         for (size_t i=0;i<n*4;++i) if (!std::isfinite(f->rgba[i])) throw std::runtime_error("nonfinite frame input");
         if (!std::isfinite(f->motion_uv_scale_x)||!std::isfinite(f->motion_uv_scale_y)) throw std::runtime_error("nonfinite motion scale");
@@ -167,6 +197,7 @@ extern "C" int dlss5_run_frame(const Dlss5Frame* f) {
             for (size_t i=0;i<size_t(f->motion_width)*f->motion_height*2;++i)
                 if (!std::isfinite(f->motion[i])) throw std::runtime_error("nonfinite motion");
         }
+        ft.mark("validate");
         dlss5::hip_check(hipSetDevice(g_gpu),"frame device");
         if (!g_frame) {auto next=std::make_unique<FrameBuffers>();next->create();g_frame=std::move(next);}
         auto& b=*g_frame;
@@ -174,8 +205,13 @@ extern "C" int dlss5_run_frame(const Dlss5Frame* f) {
         b.previous_flags=f->flags;b.previous_white=f->paper_white;
         dlss5::FrameSettings settings{f->paper_white,f->transfer,f->color,(f->flags&1u)!=0};
         b.source.upload(f->rgba,n*16);
+        ft.mark("up_src");
         dlss5::frame_encode(b.source.as<float>(),b.proxy.as<float>(),1920,1080,settings,nullptr);
-        dlss5::hip_check(hipStreamSynchronize(nullptr),"frame encode");b.proxy.download(b.host_proxy.data(),n*16);
+        ft.mark("encode");
+        // Proxy stays on the GPU (frame_encode output). No download to host: the
+        // network reads the device buffer directly via run_gpu.
+        dlss5::hip_check(hipStreamSynchronize(nullptr),"frame encode");
+        ft.mark("sync_encode");
         bool temporal=b.history_valid&&f->motion;
         if (temporal) {
             size_t bytes=size_t(f->motion_width)*f->motion_height*8;
@@ -186,16 +222,64 @@ extern "C" int dlss5_run_frame(const Dlss5Frame* f) {
             dlss5::frame_warp(b.proxy.as<float>(),nullptr,nullptr,b.base.as<float>(),1920,1080,1920,1152,0,0,0,0,true,nullptr);
             dlss5::frame_guard(b.base.as<float>(),b.warped.as<float>(),1920*1152,3.f/255,12.f/255,nullptr);
             dlss5::hip_check(hipStreamSynchronize(nullptr),"frame history");b.warped.download(b.host_warped.data(),b.host_warped.size()*4);
+            ft.mark("warp");
         }
-        g_net->run(b.host_proxy.data(),b.host_neural.data(),f->seed,temporal?b.host_warped.data():nullptr);
+        // Feed the GPU-resident proxy straight to the network (no host round-trip).
+        g_net->run_gpu(b.proxy.as<float>(),b.host_neural.data(),f->seed,temporal?b.host_warped.data():nullptr);
+        ft.mark("net");
         for (float v:b.host_neural) if (!std::isfinite(v)) throw std::runtime_error("nonfinite neural output");
         b.neural.upload(b.host_neural.data(),n*12);
+        ft.mark("up_neural");
         if (temporal) dlss5::frame_smooth(b.warped.as<float>(),b.neural.as<float>(),unsigned(n),10.f/255,.8f,nullptr);
         dlss5::frame_decode(b.source.as<float>(),b.proxy.as<float>(),b.neural.as<float>(),b.decoded.as<float>(),1920,1080,settings,nullptr);
+        ft.mark("decode");
         dlss5::hip_check(hipStreamSynchronize(nullptr),"frame decode");b.decoded.download(b.host_result.data(),n*12);
+        ft.mark("sync_dl_dec");
         for (float v:b.host_result) if (!std::isfinite(v)) throw std::runtime_error("nonfinite decoded output");
         dlss5::hip_check(hipMemcpy(b.history.p,b.neural.p,n*12,hipMemcpyDeviceToDevice),"save history");b.history_valid=true;
-        std::memcpy(f->rgb,b.host_result.data(),n*12);g_err.clear();return 0;
+        std::memcpy(f->rgb,b.host_result.data(),n*12);ft.mark("memcpy");g_err.clear();return 0;
+    } catch(const std::exception&e) {if(g_frame)g_frame->history_valid=false;set_err(e.what());return -1;}
+}
+
+// Fully GPU-resident frame path: dev_in is a DEVICE pointer to the 1920x1080 RGBA
+// frame (the D3D12 texture mapped into HIP) and dev_out is a DEVICE pointer that
+// receives the 1920x1080 RGB result. No H2D input upload, no D2H output download:
+// encode -> network -> decode all run on the GPU. dev_history (optional) is a DEVICE
+// pointer to the warped 1920x1152 RGBA history, or null.
+extern "C" int dlss5_run_frame_gpu(const float* dev_in, float* dev_out, uint32_t seed,
+                                   float paper_white, float transfer, float color, uint32_t flags,
+                                   const float* dev_history) {
+    std::lock_guard<std::mutex> lock(g_mu);
+    if (!g_net) return set_err("not initialized"), -1;
+    if (!dev_in || !dev_out || dev_in == dev_out) return set_err("null/aliased gpu buffers"), -1;
+    try {
+        FrameTimer ft;
+        const size_t n=1920ull*1080;
+        ft.mark("validate");
+        dlss5::hip_check(hipSetDevice(g_gpu),"frame device");
+        if (!g_frame) {auto next=std::make_unique<FrameBuffers>();next->create();g_frame=std::move(next);}
+        auto& b=*g_frame;
+        b.previous_flags=flags;b.previous_white=paper_white;
+        dlss5::FrameSettings settings{paper_white,transfer,color,(flags&1u)!=0};
+        // Input is already a device buffer (the D3D12 texture). D2D into source —
+        // no H2D upload (the CPU path uploads 33MB).
+        dlss5::hip_check(hipMemcpyAsync(b.source.p,dev_in,n*16,hipMemcpyDeviceToDevice,nullptr),"gpu input d2d");
+        ft.mark("up_src");
+        dlss5::frame_encode(b.source.as<float>(),b.proxy.as<float>(),1920,1080,settings,nullptr);
+        ft.mark("encode");
+        // Fully GPU-resident network: the proxy stays on the GPU and the neural
+        // output is written to b.neural on the GPU (no D2H + H2D round-trip).
+        g_net->run_gpu_gpu(b.proxy.as<float>(),b.neural.as<float>(),seed,dev_history);
+        ft.mark("net");
+        if (dev_history) dlss5::frame_smooth(b.warped.as<float>(),b.neural.as<float>(),unsigned(n),10.f/255,.8f,nullptr);
+        dlss5::frame_decode(b.source.as<float>(),b.proxy.as<float>(),b.neural.as<float>(),b.decoded.as<float>(),1920,1080,settings,nullptr);
+        ft.mark("decode");
+        dlss5::hip_check(hipStreamSynchronize(nullptr),"frame decode gpu");
+        ft.mark("sync_dl_dec");
+        // Output is written to the D3D12 texture (device) — no D2H + CPU memcpy.
+        dlss5::hip_check(hipMemcpyAsync(dev_out,b.decoded.p,n*12,hipMemcpyDeviceToDevice,nullptr),"gpu output d2d");
+        ft.mark("memcpy");
+        g_err.clear();return 0;
     } catch(const std::exception&e) {if(g_frame)g_frame->history_valid=false;set_err(e.what());return -1;}
 }
 

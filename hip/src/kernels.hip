@@ -81,19 +81,19 @@ void launch_ffn_f32_f8in_f8out(int c, const u8* in_f8, const u8* w, const float*
     default: throw std::runtime_error("FFN f8in channels");
     }
 }
-void launch_ffn_f32_hin_f8out(int c, const __half* in_h, const u8* w, const float* scales,
-                              float* out_f32, u8* out_f8, uint tokens, bool chain_residual,
-                              bool precise_c32) {
-    if (!tokens || c == 32 || c == 512 || !in_h || !out_f32 || !out_f8)
-        throw std::runtime_error("FFN f16in extent/alias");
-    uint groups = (tokens + 15) / 16;
-    switch (c) {
-    case 64: LAUNCH((k_ffn_f32<64, true, 1, false, false, true>), groups, 128, nullptr, w, scales,
-                    out_f32, out_f8, tokens, chain_residual, precise_c32, nullptr, nullptr, in_h); break;
+ void launch_ffn_f32_hin_f8out(int c, const __half* in_h, const u8* w, const float* scales,
+                               float* out_f32, u8* out_f8, uint tokens, bool chain_residual,
+                               bool precise_c32, unsigned char* dbg_hidden, float* dbg_ex) {
+     if (!tokens || c == 32 || c == 512 || !in_h || !out_f32 || !out_f8)
+         throw std::runtime_error("FFN f16in extent/alias");
+     uint groups = (tokens + 15) / 16;
+     switch (c) {
+     case 64: LAUNCH((k_ffn_f32<64, true, 1, false, false, true>), groups, 128, nullptr, w, scales,
+                     out_f32, out_f8, tokens, chain_residual, precise_c32, nullptr, nullptr, in_h, dbg_hidden, dbg_ex); break;
     case 128: LAUNCH((k_ffn_f32<128, true, 1, false, false, true>), groups, 256, nullptr, w, scales,
-                     out_f32, out_f8, tokens, chain_residual, precise_c32, nullptr, nullptr, in_h); break;
+                     out_f32, out_f8, tokens, chain_residual, precise_c32, nullptr, nullptr, in_h, dbg_hidden, dbg_ex); break;
     case 256: LAUNCH((k_ffn_f32<256, true, 1, false, false, true>), groups, 512, nullptr, w, scales,
-                     out_f32, out_f8, tokens, chain_residual, precise_c32, nullptr, nullptr, in_h); break;
+                     out_f32, out_f8, tokens, chain_residual, precise_c32, nullptr, nullptr, in_h, dbg_hidden, dbg_ex); break;
     default: throw std::runtime_error("FFN f16in channels");
     }
 }
@@ -709,6 +709,103 @@ void launch_c32_fused(const __half* in_h, const u8* ffn_w, const float* ffn_s, c
         }
     }
     #undef C32_FUSED_LAUNCH
+}
+
+// Production upstream MH chain (C64/128/256): FFN + p0 + QKV + norm in one kernel, then the
+// attention+projection kernel (it recomputes QK/softmax/AV from the QKV bytes, adds the p1
+// projection + residual, and stores with crop). Inputs are windowed (linear tokens x C);
+// weights are the prepacked prod-layout tables. The f8 raster (out8) and the windowed f32
+// (out_f32, run() reframes it) are independent consumers; launch each when requested.
+void launch_mh_prod(const float* in32, const u8* in8, const __half* in16, const float* fw_mh,
+                    const float* aw_mh, u8* feat8, u8* qkv8, u8* out8, float* out_f32, uint c,
+                    uint tokens, uint sw, uint sh, uint w, uint h, uint px, uint py, bool raw,
+                    unsigned char* dbg_hidden, unsigned char* dbg_d, float* dbg_ex) {
+    if ((!in32 && !in8 && !in16) || !fw_mh || !aw_mh || !feat8 || !qkv8 || (!out8 && !out_f32) ||
+        tokens % 16 || sw % 8 || sh % 8 || w + px > sw || h + py > sh)
+        throw std::runtime_error("MH prod extent/alias");
+    const uint blocks = (tokens + 15) / 16;
+    switch (c) {
+    case 64:
+        if (in8)
+            LAUNCH((mh_ffn_fused_c64_project_g128_qkv_bytein_fb), blocks, 128,
+                   reinterpret_cast<const float*>(in8), fw_mh, aw_mh, feat8, qkv8, tokens);
+        else LAUNCH((mh_ffn_fused_c64_hin_project_g128_qkv_fb), blocks, 128,
+                    reinterpret_cast<const float*>(in16), fw_mh, aw_mh, feat8, qkv8, tokens,
+                    dbg_hidden, dbg_d, dbg_ex);
+        break;
+    case 128:
+        if (in8)
+            LAUNCH((mh_ffn_fused_c128_project_g128_qkv_bytein_fb), blocks, 256,
+                   reinterpret_cast<const float*>(in8), fw_mh, aw_mh, feat8, qkv8, tokens);
+        else LAUNCH((mh_ffn_fused_c128_hin_project_g128_qkv_fb), blocks, 256,
+                    reinterpret_cast<const float*>(in16), fw_mh, aw_mh, feat8, qkv8, tokens,
+                    dbg_hidden, dbg_ex, dbg_d);
+        break;
+    default:
+        if (in8)
+            LAUNCH((mh_ffn_fused_c256_tiled_project_g128_qkv_bytein_fb), blocks, 512,
+                   reinterpret_cast<const float*>(in8), fw_mh, aw_mh, feat8, qkv8, tokens);
+        else LAUNCH((mh_ffn_fused_c256_hin_project_g128_qkv_fb), blocks, 512,
+                    reinterpret_cast<const float*>(in16), fw_mh, aw_mh, feat8, qkv8, tokens,
+                    dbg_ex, dbg_d);
+        break;
+    }
+    const uint pw = (sw / 8) * (sh / 8);
+    if (out8) {
+        // Cropped f8 raster consumed by the next block's reframe; F(v) matches mode-5 stores.
+        switch (c) {
+        case 64:
+            LAUNCH((c64_attention_project_fb_bout), pw, 256, qkv8, aw_mh, feat8, out8, sw, sh, 4u, w, h,
+                   px, py);
+            break;
+        case 128:
+            LAUNCH((c128_attention_project_fb_bout), pw, 512, qkv8, aw_mh, feat8, out8, sw, sh, 4u, w, h,
+                   px, py);
+            break;
+        default:
+            LAUNCH((c256_attention_project_fb_bout), pw, 512, qkv8, aw_mh, feat8, out8, sw, sh, 4u, w, h,
+                   px, py);
+            break;
+        }
+    }
+    if (out_f32) {
+        // Windowed f32 (run() reframes to the raster): raw blocks store H(v) (split mode 0),
+        // non-raw blocks store F(v) (split mode 5).
+        const uint post32 = raw ? 6u : 4u;
+        switch (c) {
+        case 64:
+            LAUNCH((c64_attention_project_fb), pw, 256, qkv8, aw_mh, feat8, out_f32, sw, sh, post32,
+                   0u, 0u, 0u, 0u);
+            break;
+        case 128:
+            LAUNCH((c128_attention_project_fb), pw, 512, qkv8, aw_mh, feat8, out_f32, sw, sh, post32,
+                   0u, 0u, 0u, 0u);
+            break;
+        default:
+            LAUNCH((c256_attention_project_fb), pw, 512, qkv8, aw_mh, feat8, out_f32, sw, sh, post32,
+                   0u, 0u, 0u, 0u);
+            break;
+        }
+    }
+}
+
+// Production upstream C32 FAST4 chain: one kernel per window block (FFN + QKV + norm +
+// attention + projection + residual). Weights are the prepacked prod-layout tables.
+void launch_c32_prod(const __half* in_h, const float* fw, const float* wgt, __half* out_h,
+                     __half* out_h_raster, uint w, uint h, uint sw, uint sh, uint px, uint py,
+                     bool chain) {
+    if (!in_h || !fw || !wgt || !out_h || sw % 8 || sh % 8 || w + px > sw || h + py > sh)
+        throw std::runtime_error("C32 prod extent/alias");
+    const uint nwin = sw * sh / 64u;
+    if (out_h_raster)
+        LAUNCH((c32_fast_ffn_attention_fused_half_chain_raster), nwin, 128,
+               reinterpret_cast<const float*>(in_h), fw, wgt, reinterpret_cast<float*>(out_h),
+               reinterpret_cast<float*>(out_h_raster), nwin, chain ? 3u : 0u, 0u, w, h, px, py, sw,
+               px, py);
+    else
+        LAUNCH((c32_fast_ffn_attention_fused_half_chain), nwin, 128,
+               reinterpret_cast<const float*>(in_h), fw, wgt, reinterpret_cast<float*>(out_h),
+               nwin, chain ? 3u : 0u, 0u, w, h, px, py, sw, px, py);
 }
 
 } // namespace dlss5

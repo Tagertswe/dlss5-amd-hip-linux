@@ -8,13 +8,16 @@ HIPCC=/opt/rocm/bin/hipcc
 mkdir -p "$B"
 FLAGS=(--offload-arch=gfx1201 -O3 -std=c++17 -Ihip/include)
 "$HIPCC" "${FLAGS[@]}" -c hip/src/kernels.hip -o "$B/kernels.o"
+"$HIPCC" "${FLAGS[@]}" -DHIP_PREPACKED_WEIGHTS -c hip/src/kernels_prod.hip -o "$B/kernels_prod.o"
+"$HIPCC" "${FLAGS[@]}" -c hip/src/kernels_mh1.hip -o "$B/kernels_mh1.o"
+"$HIPCC" "${FLAGS[@]}" -c hip/src/kernels_mh2.hip -o "$B/kernels_mh2.o"
 "$HIPCC" "${FLAGS[@]}" -c hip/src/network.hip -o "$B/network.o"
 for t in test_wmma test_stages test_quantize test_attention test_residual test_linear test_logical_ops test_ffn_f32 test_graph_ops test_graph_blocks test_graph_stream test_graph_vit test_network test_configured_path; do
   precision=(-ffp-contract=off)
   # The precise C32 regression must run under production contraction settings.
   if [[ "$t" == test_configured_path ]]; then precision=(); fi
   "$HIPCC" "${FLAGS[@]}" "${precision[@]}" -c "hip/tests/$t.hip" -o "$B/$t.o"
-  objects=("$B/$t.o" "$B/kernels.o")
+  objects=("$B/$t.o" "$B/kernels.o" "$B/kernels_prod.o" "$B/kernels_mh1.o" "$B/kernels_mh2.o")
   # Block and ViT tests include network.hip to reach the real internal scheduler.
   if [[ "$t" == test_network ]]; then objects+=("$B/network.o"); fi
   "$HIPCC" "${objects[@]}" -Wl,-rpath,/opt/rocm/lib -o "$B/$t"

@@ -53,9 +53,10 @@ void launch_ffn_f32_f8(int c, const float* in, const u8* w, const float* scales,
 void launch_ffn_f32_f8in_f8out(int c, const u8* in_f8, const u8* w, const float* scales,
                                float* out_f32, u8* out_f8, uint tokens, bool chain_residual,
                                bool precise_c32);
-void launch_ffn_f32_hin_f8out(int c, const __half* in_h, const u8* w, const float* scales,
-                              float* out_f32, u8* out_f8, uint tokens, bool chain_residual,
-                              bool precise_c32);
+ void launch_ffn_f32_hin_f8out(int c, const __half* in_h, const u8* w, const float* scales,
+                               float* out_f32, u8* out_f8, uint tokens, bool chain_residual,
+                               bool precise_c32, unsigned char* dbg_hidden = nullptr,
+                               float* dbg_ex = nullptr);
 void launch_qkv_norm_f32_f8in(int c, const u8* in, const u8* w, u8* out, uint m,
                               const float* scales, float qgain, bool half_squares);
 void launch_qkv_norm_f32_hin(int c, const __half* in, const u8* w, u8* out, uint m,
@@ -151,5 +152,57 @@ void launch_c32_fused(const __half* in_h, const u8* ffn_w, const float* ffn_s, c
                       const float* qscale, const float* bias, const u8* proj_w, const float* proj_s,
                       __half* ffn_h, __half* out_h, __half* out_h_raster, uint w, uint h, uint sw,
                       uint sh, uint px, uint py, bool chain, bool windowed, bool write_out = true);
+void launch_c32_prod(const __half* in_h, const float* fw, const float* wgt, __half* out_h,
+                     __half* out_h_raster, uint w, uint h, uint sw, uint sh, uint px, uint py,
+                     bool chain);
+  void launch_mh_prod(const float* in32, const u8* in8, const __half* in16, const float* fw_mh,
+                      const float* aw_mh, u8* feat8, u8* qkv8, u8* out8, float* out_f32, uint c,
+                      uint tokens, uint sw, uint sh, uint w, uint h, uint px, uint py,
+                      bool raw = false, unsigned char* dbg_hidden = nullptr, unsigned char* dbg_d = nullptr,
+                      float* dbg_ex = nullptr);
 
 } // namespace dlss5
+
+__global__ void c32_fast_ffn_attention_fused_half_chain(const float* in, const float* fw,
+    const float* w, float* out, unsigned windows, unsigned mode, unsigned raw, unsigned width,
+    unsigned height, unsigned sx, unsigned sy, unsigned prevw, unsigned prevsx, unsigned prevsy);
+__global__ void c32_fast_ffn_attention_fused_half_chain_raster(const float* in, const float* fw,
+    const float* w, float* out, float* raster, unsigned windows, unsigned mode, unsigned raw,
+    unsigned width, unsigned height, unsigned sx, unsigned sy, unsigned prevw, unsigned prevsx,
+    unsigned prevsy);
+
+extern "C" __global__ void mh_ffn_fused_c64_hin_project_g128_qkv_fb(const float* in, const float* w,
+    const float* aw, unsigned char* out, unsigned char* norm, unsigned tokens,
+    unsigned char* dbg_hidden, unsigned char* dbg_d, float* dbg_ex);
+extern "C" __global__ void mh_ffn_fused_c128_hin_project_g128_qkv_fb(const float* in, const float* w,
+    const float* aw, unsigned char* out, unsigned char* norm, unsigned tokens,
+    unsigned char* dbg_hidden, float* dbg_ex, unsigned char* dbg_st);
+extern "C" __global__ void mh_ffn_fused_c256_hin_project_g128_qkv_fb(const float* in, const float* w,
+    const float* aw, unsigned char* out, unsigned char* norm, unsigned tokens, float* dbg_ex,
+    unsigned char* dbg_st);
+extern "C" __global__ void mh_ffn_fused_c64_project_g128_qkv_bytein_fb(const float* in, const float* w,
+    const float* aw, unsigned char* out, unsigned char* norm, unsigned tokens);
+extern "C" __global__ void mh_ffn_fused_c128_project_g128_qkv_bytein_fb(const float* in, const float* w,
+    const float* aw, unsigned char* out, unsigned char* norm, unsigned tokens);
+extern "C" __global__ void mh_ffn_fused_c256_tiled_project_g128_qkv_bytein_fb(const float* in, const float* w,
+    const float* aw, unsigned char* out, unsigned char* norm, unsigned tokens);
+extern "C" __global__ void mh_attention_fused_fp8_out(const unsigned char* normalized, const float* w,
+    unsigned char* out, unsigned width, unsigned height, unsigned channels);
+extern "C" __global__ void c64_attention_project_fb(const unsigned char* normalized, const float* w,
+    const unsigned char* feature, float* out, unsigned width, unsigned height, unsigned post,
+    unsigned cropw, unsigned croph, unsigned sx, unsigned sy);
+extern "C" __global__ void c64_attention_project_fb_bout(const unsigned char* normalized, const float* w,
+    const unsigned char* feature, unsigned char* out, unsigned width, unsigned height, unsigned post,
+    unsigned cropw, unsigned croph, unsigned sx, unsigned sy);
+extern "C" __global__ void c128_attention_project_fb(const unsigned char* normalized, const float* w,
+    const unsigned char* feature, float* out, unsigned width, unsigned height, unsigned post,
+    unsigned cropw, unsigned croph, unsigned sx, unsigned sy);
+extern "C" __global__ void c128_attention_project_fb_bout(const unsigned char* normalized, const float* w,
+    const unsigned char* feature, unsigned char* out, unsigned width, unsigned height, unsigned post,
+    unsigned cropw, unsigned croph, unsigned sx, unsigned sy);
+extern "C" __global__ void c256_attention_project_fb(const unsigned char* normalized, const float* w,
+    const unsigned char* feature, float* out, unsigned width, unsigned height, unsigned post,
+    unsigned cropw, unsigned croph, unsigned sx, unsigned sy);
+extern "C" __global__ void c256_attention_project_fb_bout(const unsigned char* normalized, const float* w,
+    const unsigned char* feature, unsigned char* out, unsigned width, unsigned height, unsigned post,
+    unsigned cropw, unsigned croph, unsigned sx, unsigned sy);

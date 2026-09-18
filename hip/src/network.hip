@@ -1,7 +1,9 @@
 #include "dlss5_network.hpp"
 #include "dlss5_launch.hpp"
+#include "dlss5_pack.hpp"
 #include <algorithm>
 #include <array>
+#include <cstdio>
 #include <cmath>
 #include <cstdlib>
 #include <filesystem>
@@ -47,16 +49,17 @@ struct Scratch {
   void create(){const size_t n=size_t(W+8)*(Ht+8)*32;a.alloc(n*4);b.alloc(n*4);bh.alloc(n*2);ah.alloc(n*2);d.alloc(n*4);q.alloc(n*12);q8.alloc(n*3);att8.alloc(n);hidden.alloc(640ull*4096*4);hidden8.alloc(640ull*4096);d8.alloc(n);f8.alloc(n);out8.alloc(n);a8.alloc(n);out16.alloc(n*2);a16.alloc(n*2);}
 };
 struct Block {
-  uint c{},w{},h{},px{},py{},sw{},sh{};bool raw{},chain{},windowed{};
-  DeviceBuf fw,fs,ex,ct,p0,s0,qw,qs,bias,p1,s1,ffn_rw,qw_rw,p1_rw;
+    uint c{},w{},h{},px{},py{},sw{},sh{};bool raw{},chain{},windowed{};int id{-1};
+    DeviceBuf fw,fs,ex,ct,p0,s0,qw,qs,bias,p1,s1,ffn_rw,qw_rw,p1_rw,fw_prod,w_prod,fw_mh,aw_mh;
   void create(const std::string&dir,int id,uint channels,uint width,uint height,uint shift,bool raw_output){
-   c=channels;w=width;h=height;px=(shift&1)?4:0;py=(shift&2)?4:0;  sw=(w+px+7)&~7u;sh=(h+py+7)&~7u;raw=raw_output;windowed=(id!=0);
+    c=channels;w=width;h=height;px=(shift&1)?4:0;py=(shift&2)?4:0;  sw=(w+px+7)&~7u;sh=(h+py+7)&~7u;raw=raw_output;windowed=(id!=0);this->id=id;
    chain=c==32&&(id==2||id==3||id==4||id==67||id==68||id==69);
-   std::string p=id==70?"post70":"block"+std::to_string(id);size_t m=size_t(c)*c;
-   if(c==512){auto f=load(dir,p+"-ffwd",524288);fw=upload_tiled_e4m3(f.data(),512,512);
-    std::vector<u8> e(131072),t(131072);for(uint g=0;g<8;++g){pack_tiled_e4m3(e.data()+g*16384,f.data()+262144+g*16384,256,64);pack_tiled_e4m3(t.data()+g*16384,f.data()+393216+g*16384,64,256);}ex.alloc(e.size());ex.upload(e.data(),e.size());ct.alloc(t.size());ct.upload(t.data(),t.size());
-    auto fproj=load(dir,p+"-ffwd-projection",262656);p0=upload_tiled_e4m3(fproj.data(),c,c);s0=floats(fproj.data()+m,c);
-   }else {auto f=load(dir,p+"-ffn",c==32?8736:9*m+c);size_t off=c==32?512:0;
+    std::string p=id==70?"post70":"block"+std::to_string(id);size_t m=size_t(c)*c;
+    std::vector<float> f32;
+    if(c==512){auto f=load(dir,p+"-ffwd",524288);fw=upload_tiled_e4m3(f.data(),512,512);
+     std::vector<u8> e(131072),t(131072);for(uint g=0;g<8;++g){pack_tiled_e4m3(e.data()+g*16384,f.data()+262144+g*16384,256,64);pack_tiled_e4m3(t.data()+g*16384,f.data()+393216+g*16384,64,256);}ex.alloc(e.size());ex.upload(e.data(),e.size());ct.alloc(t.size());ct.upload(t.data(),t.size());
+     auto fproj=load(dir,p+"-ffwd-projection",262656);p0=upload_tiled_e4m3(fproj.data(),c,c);s0=floats(fproj.data()+m,c);
+    }else {auto f=load(dir,p+"-ffn",c==32?8736:9*m+c);f32=f;size_t off=c==32?512:0;
     std::vector<u8> t(8*m);pack_tiled_e4m3(t.data(),f.data()+off,4*c,c);pack_tiled_e4m3(t.data()+4*m,f.data()+off+4*m,c,4*c);fw.alloc(t.size());fw.upload(t.data(),t.size());
     if(c==32){
      fs=floats(f.data()+8704,32);
@@ -66,21 +69,68 @@ struct Block {
      ffn_rw.alloc(rw.size());ffn_rw.upload(rw.data(),rw.size());
     }else{p0=upload_tiled_e4m3(f.data()+8*m,c,c);s0=floats(f.data()+9*m,c);}
    }
-   auto a=load(dir,p+"-attention",4*m+(c/32)*4096+c/32+c);
-   qw=upload_tiled_e4m3(a.data(),3*c,c);p1=upload_tiled_e4m3(a.data()+3*m,c,c);bias=floats(a.data()+4*m,(c/32)*4096);qs=floats(a.data()+4*m+(c/32)*4096,c/32);s1=floats(a.data()+4*m+(c/32)*4096+c/32,c);
-   if(c==32){
-    std::vector<u8> qr(3072),pr(1024);
-    for(uint n=0;n<96;++n)for(uint k=0;k<32;++k)qr[n*32+k]=e4m3_byte(a[n*32+k]);
-    for(uint n=0;n<32;++n)for(uint k=0;k<32;++k)pr[n*32+k]=e4m3_byte(a[3072+n*32+k]);
-    qw_rw.alloc(qr.size());qw_rw.upload(qr.data(),qr.size());
-    p1_rw.alloc(pr.size());p1_rw.upload(pr.data(),pr.size());
+    auto a=load(dir,p+"-attention",4*m+(c/32)*4096+c/32+c);
+    qw=upload_tiled_e4m3(a.data(),3*c,c);p1=upload_tiled_e4m3(a.data()+3*m,c,c);bias=floats(a.data()+4*m,(c/32)*4096);qs=floats(a.data()+4*m+(c/32)*4096,c/32);s1=floats(a.data()+4*m+(c/32)*4096+c/32,c);
+    if(c!=32&&c!=512){
+     // Prod-layout MH tables (upstream). The kernels read each matrix region through a
+     // uint* at uint offset = the region's float base, i.e. e4m3 bytes at byte 4*base:
+     //   FFN : expand@0, contract@4C^2->byte16C^2, p0@8C^2->byte32C^2 (scale f32 @9C^2)
+     //   Attn: QKV@0, p1@3C^2->byte12C^2 (bias/qscale/pscale stay f32)
+     // Packing the 9C^2 / 4C^2 bytes contiguously is wrong: contract/p0/p1 land in gaps.
+     std::vector<float> fmh=f32,amh=a;
+     auto pk=[](std::vector<float>&v,size_t byte_off,const float*src,size_t n){auto* b=reinterpret_cast<uint8_t*>(v.data())+byte_off;for(size_t i=0;i<n;++i)b[i]=e4m3_byte(src[i]);};
+      if(c==256){
+       // The C256 prod FFN kernel reads expand/contract as 16x32 e4m3 tiles (Tiled);
+       // p0 stays row-major. C64/C128 read all three row-major.
+       pack_tiled_e4m3(reinterpret_cast<u8*>(fmh.data()),f32.data(),4*c,c);
+       pack_tiled_e4m3(reinterpret_cast<u8*>(fmh.data())+16*m,f32.data()+4*m,c,4*c);
+       pk(fmh,32*m,f32.data()+8*m,m);
+      }else{
+       pk(fmh,0,f32.data(),4*m);
+       pk(fmh,16*m,f32.data()+4*m,4*m);
+       pk(fmh,32*m,f32.data()+8*m,m);
+      }
+     pk(amh,0,a.data(),3*m);
+     pk(amh,12*m,a.data()+3*m,m);
+     fw_mh.alloc(fmh.size()*4);fw_mh.upload(fmh.data(),fmh.size()*4);
+     aw_mh.alloc(amh.size()*4);aw_mh.upload(amh.data(),amh.size()*4);
+    }
+    if(c==32){
+     std::vector<u8> qr(3072),pr(1024);
+     for(uint n=0;n<96;++n)for(uint k=0;k<32;++k)qr[n*32+k]=e4m3_byte(a[n*32+k]);
+     for(uint n=0;n<32;++n)for(uint k=0;k<32;++k)pr[n*32+k]=e4m3_byte(a[3072+n*32+k]);
+     qw_rw.alloc(qr.size());qw_rw.upload(qr.data(),qr.size());
+     p1_rw.alloc(pr.size());p1_rw.upload(pr.data(),pr.size());
+     // Prod-layout tables (upstream FAST4): QKV/proj FP8 at byte 0/3072 with the
+     // bias/scales at their f32 addresses; FFN prefix/scale f32 kept, expand/contract
+     // FP8 at byte 2048/18432, chain residual diagonal B tiles appended after the
+     // scale region (byte 34944). e4m3_byte matches the kernel fp8() bit-for-bit.
+     std::vector<float> fp32(f32.size(),0.f),w32(8225);
+     auto* fb=reinterpret_cast<uint8_t*>(fp32.data()),*wb=reinterpret_cast<uint8_t*>(w32.data());
+     for(uint i=0;i<4096;++i)fb[2048+i]=e4m3_byte(f32[512+i]);
+     for(uint i=0;i<4096;++i)fb[18432+i]=e4m3_byte(f32[4608+i]);
+     for(uint i=0;i<3072;++i)wb[i]=e4m3_byte(a[i]);
+     for(uint i=0;i<1024;++i)wb[3072+i]=e4m3_byte(a[3072+i]);
+     std::memcpy(fp32.data(),f32.data(),2048);
+     std::memcpy(fp32.data()+8704,f32.data()+8704,128);
+     std::memcpy(w32.data()+4096,a.data()+4096,(8225-4096)*4);
+     if(chain)AppendC32ResidualDiagonals(fp32);
+     fw_prod.alloc(fp32.size()*4);fw_prod.upload(fp32.data(),fp32.size()*4);
+     w_prod.alloc(w32.size()*4);w_prod.upload(w32.data(),w32.size()*4);
+    }
    }
-  }
  // The only physical activation format here is window-major [window][64][C].
  // Residuals remain distinct from quantized matrix operands.
   void window(const float* in,float* out,Scratch&s,const u8* in_f8=nullptr,bool emit_f8=false,
               const __half* in_h=nullptr,bool emit_h=false,bool write_f32_out=true){
     uint n=sw*sh;float* f=s.b.as<float>();
+      unsigned char* dbg_hidden=nullptr;
+      {const char* ds1=getenv("DLSS5_DUMP_SCRATCH");if(ds1&&c==64&&id==atoi(ds1)&&in_h){hip_check(hipMalloc(&dbg_hidden,size_t(n)*4*c),"dbg_h1");}}
+      if(c==32 && in_h && std::getenv("DLSS5_C32_PROD") && std::string(std::getenv("DLSS5_C32_PROD")) == "1"){
+       launch_c32_prod(in_h,fw_prod.as<float>(),w_prod.as<float>(),s.ah.as<__half>(),
+                       windowed?s.out16.as<__half>():nullptr,w,h,sw,sh,px,py,chain);
+       return;
+      }
       if(c==32 && in_h && std::getenv("DLSS5_C32_FUSED") && std::string(std::getenv("DLSS5_C32_FUSED")) == "1"){
        const bool write_ffn = std::getenv("DLSS5_C32_FFN_OUT") &&
                               std::string(std::getenv("DLSS5_C32_FFN_OUT")) != "0";
@@ -91,8 +141,36 @@ struct Block {
                         write_f32_out);
        return;
       }
-     if(c==512){
-     if(in_h)launch_split_f32_hin_f8(in_h,fw.as<u8>(),ex.as<u8>(),ct.as<u8>(),s.d.as<float>(),s.d8.as<u8>(),n);
+      if((c==64||c==128||c==256) && std::getenv("DLSS5_MH_PROD") && std::string(std::getenv("DLSS5_MH_PROD"))=="1"){
+        const uint n2=sw*sh;
+         unsigned char* dbg_hidden=nullptr,*dbg_d=nullptr;
+         {const char* ds0=getenv("DLSS5_DUMP_SCRATCH");if(ds0&&c==64&&id==atoi(ds0)&&in_h){hip_check(hipMalloc(&dbg_hidden,size_t(n2)*4*c),"dbg_h");hip_check(hipMalloc(&dbg_d,size_t(n2)*c),"dbg_d");}}
+         if(in_h)launch_mh_prod(nullptr,nullptr,in_h,fw_mh.as<float>(),aw_mh.as<float>(),s.f8.as<u8>(),s.q8.as<u8>(),emit_f8?s.out8.as<u8>():nullptr,write_f32_out?out:nullptr,c,n2,sw,sh,w,h,px,py,raw,dbg_hidden,dbg_d);
+         else if(in_f8)launch_mh_prod(nullptr,in_f8,nullptr,fw_mh.as<float>(),aw_mh.as<float>(),s.f8.as<u8>(),s.q8.as<u8>(),emit_f8?s.out8.as<u8>():nullptr,write_f32_out?out:nullptr,c,n2,sw,sh,w,h,px,py,raw,dbg_hidden,dbg_d);
+         else throw std::runtime_error("MH prod requires f8/f16 window input");
+         if(const char* ds=getenv("DLSS5_DUMP_SCRATCH")){int bid=atoi(ds);
+         if(id==bid){const char* tag=getenv("DLSS5_DUMP_TAG")?getenv("DLSS5_DUMP_TAG"):"x";
+          auto dump=[&](const char* name,const void* p,size_t n){std::string fn=std::string("/tmp/opencode/sc_")+name+"_"+tag+".bin";std::vector<char> h(n);hip_check(hipMemcpy(h.data(),p,n,hipMemcpyDeviceToHost),"dumpsc");FILE* fp=fopen(fn.c_str(),"wb");if(fp){std::fwrite(h.data(),n,1,fp);fclose(fp);}};
+          hipStreamSynchronize(get_launch_stream());
+            if(dbg_d){dump("dh",dbg_hidden,size_t(n2)*4*c);dump("dd",dbg_d,size_t(n2)*c);hipFree(dbg_hidden);hipFree(dbg_d);}
+            dump("f8",s.f8.p,size_t(n2)*c);dump("q8",s.q8.p,size_t(n2)*3*c);if(emit_f8)dump("out8",s.out8.p,size_t(w)*h*c);dump("a16",s.a16.p,size_t(n2)*c*2);dump("att8",s.att8.p,size_t(n2)*c);}}
+       if(const char* dbg=std::getenv("DLSS5_MH_DBG")){
+        std::vector<float> feat(n2*c),qkv(n2*3*c);
+        std::vector<u8> fb(feat.size()),qb(qkv.size());
+        hipStreamSynchronize(get_launch_stream());
+        hipMemcpy(fb.data(),s.f8.p,fb.size(),hipMemcpyDeviceToHost);
+        hipMemcpy(qb.data(),s.q8.p,qb.size(),hipMemcpyDeviceToHost);
+        float fmax=0,qmax=0;
+         for(size_t i=0;i<feat.size();++i){feat[i]=from_e4m3(fb[i]);fmax=std::max(fmax,std::abs(feat[i]));}
+         for(size_t i=0;i<qkv.size();++i){qkv[i]=from_e4m3(qb[i]);qmax=std::max(qmax,std::abs(qkv[i]));}
+         auto fnv=[](const std::vector<u8>&v){uint64_t h=1469598103934665603ULL;for(u8 b:v){h^=b;h*=1099511628211ULL;}return h;};
+         std::fprintf(stderr,"MHDBG c=%u in=%s feat_absmax=%.6g qkv_absmax=%.6g feat_hash=%012llx qkv_hash=%012llx feat0..7=%f %f %f %f %f %f %f %f\n",c,in_h?"f16":"f8",fmax,qmax,(unsigned long long)fnv(fb),(unsigned long long)fnv(qb),(double)feat[0],(double)feat[1],(double)feat[2],(double)feat[3],(double)feat[4],(double)feat[5],(double)feat[6],(double)feat[7]);
+        (void)qkv;
+       }
+       return;
+      }
+      if(c==512){
+      if(in_h)launch_split_f32_hin_f8(in_h,fw.as<u8>(),ex.as<u8>(),ct.as<u8>(),s.d.as<float>(),s.d8.as<u8>(),n);
      else if(in_f8)launch_split_f32_f8in_f8(in_f8,fw.as<u8>(),ex.as<u8>(),ct.as<u8>(),s.d.as<float>(),s.d8.as<u8>(),n);
      else launch_split_f32_f8(in,fw.as<u8>(),ex.as<u8>(),ct.as<u8>(),s.d.as<float>(),s.d8.as<u8>(),n);
     }
@@ -100,7 +178,7 @@ struct Block {
     if(in_h)launch_ffn_f32_hin_hout(32,in_h,fw.as<u8>(),fs.as<float>(),s.bh.as<__half>(),n,chain,true);
     else launch_ffn_f32_hout(32,in,fw.as<u8>(),fs.as<float>(),s.bh.as<__half>(),n,chain,true);
    }
-    else if(in_h)launch_ffn_f32_hin_f8out(c,in_h,fw.as<u8>(),nullptr,s.d.as<float>(),s.d8.as<u8>(),n,chain,false);
+     else if(in_h)launch_ffn_f32_hin_f8out(c,in_h,fw.as<u8>(),nullptr,s.d.as<float>(),s.d8.as<u8>(),n,chain,false,dbg_hidden);
     else if(in_f8)launch_ffn_f32_f8in_f8out(c,in_f8,fw.as<u8>(),nullptr,s.d.as<float>(),s.d8.as<u8>(),n,chain,false);
     else launch_ffn_f32_f8(c,in,fw.as<u8>(),nullptr,s.d.as<float>(),s.d8.as<u8>(),n,chain,false);
    // mapfeature FFN projection: H(scale product); direct store only C64..256.
@@ -125,9 +203,15 @@ struct Block {
       if(emit_h)launch_linear_f32_f8in_hrid_hout_raster(s.att8.as<u8>(),p1.as<u8>(),s.ah.as<__half>(),s.out16.as<__half>(),n,c,c,s.bh.as<__half>(),s1.as<float>(),4,0,false,w,h,sw,px,py);
       else launch_linear_f32_f8in_hrid_hout(s.att8.as<u8>(),p1.as<u8>(),s.ah.as<__half>(),n,c,c,s.bh.as<__half>(),s1.as<float>(),4,0,false);
      }
-    else if(emit_f8)launch_linear_f32_f8in_f8out_raster(s.att8.as<u8>(),p1.as<u8>(),write_f32_out?out:nullptr,s.out8.as<u8>(),n,c,c,f,s1.as<float>(),raw?0:c==512?1:5,0,c!=32&&c!=512,w,h,sw,px,py);
-     else launch_linear_f32_f8in(s.att8.as<u8>(),p1.as<u8>(),out,n,c,c,f,s1.as<float>(),raw?0:c==512?1:5,0,c!=32&&c!=512);
-  }
+     else if(emit_f8)launch_linear_f32_f8in_f8out_raster(s.att8.as<u8>(),p1.as<u8>(),write_f32_out?out:nullptr,s.out8.as<u8>(),n,c,c,f,s1.as<float>(),raw?0:c==512?1:5,0,c!=32&&c!=512,w,h,sw,px,py);
+      else launch_linear_f32_f8in(s.att8.as<u8>(),p1.as<u8>(),out,n,c,c,f,s1.as<float>(),raw?0:c==512?1:5,0,c!=32&&c!=512);
+      if(const char* ds=getenv("DLSS5_DUMP_SCRATCH")){int bid=atoi(ds);
+       if(id==bid){const char* tag=getenv("DLSS5_DUMP_TAG")?getenv("DLSS5_DUMP_TAG"):"x";
+        auto dump=[&](const char* name,const void* p,size_t n){std::string fn=std::string("/tmp/opencode/sc_")+name+"_"+tag+".bin";std::vector<char> h(n);hip_check(hipMemcpy(h.data(),p,n,hipMemcpyDeviceToHost),"dumpsc");FILE* fp=fopen(fn.c_str(),"wb");if(fp){std::fwrite(h.data(),n,1,fp);fclose(fp);}};
+          hipStreamSynchronize(get_launch_stream());
+          if(dbg_hidden){dump("dh",dbg_hidden,size_t(n)*4*c);hipFree(dbg_hidden);}
+          dump("f8",s.f8.p,size_t(n)*c);dump("q8",s.q8.p,size_t(n)*3*c);if(emit_f8)dump("out8",s.out8.p,size_t(w)*h*c);dump("a16",s.a16.p,size_t(n)*c*2);dump("bh",s.bh.p,size_t(n)*c*2);dump("d32",s.d.p,size_t(n)*c*4);dump("d8b",s.d8.p,size_t(n)*c);dump("pb",s.b.p,size_t(n)*c*4);dump("att8",s.att8.p,size_t(n)*c);}}
+    }
   void run(const float* in,float* out,Scratch&s,const u8* in_f8=nullptr,bool emit_f8=false,
            const __half* in_h=nullptr,bool emit_h=false,bool write_f32_out=true,
            bool input_f16_exact=false){
@@ -139,8 +223,19 @@ struct Block {
    }
    else if(use_f8) launch_reframe_f8in_f8out(in_f8,s.a8.as<u8>(),w,h,sw,sh,px,py,c);
    else launch_reframe_f32(in,s.a.as<float>(),w,h,sw,sh,px,py,c,0,0);
-   window(use_h||use_f8?in:s.a.as<float>(),s.a.as<float>(),s,use_f8?s.a8.as<u8>():nullptr,emit_f8,
-          use_h?s.a16.as<__half>():nullptr,emit_h,write_f32_out);
+    window(use_h||use_f8?in:s.a.as<float>(),s.a.as<float>(),s,use_f8?s.a8.as<u8>():nullptr,emit_f8,
+           use_h?s.a16.as<__half>():nullptr,emit_h,write_f32_out);
+    if(const char* dump=std::getenv("DLSS5_DUMP_F8")){
+     if(id>=0&&c==64){
+      uint n2=sw*sh;std::vector<u8> d(size_t(n2)*c);
+      std::vector<u8> r(size_t(w)*h*c);
+      hipStreamSynchronize(get_launch_stream());
+      hipMemcpy(d.data(),s.f8.p,d.size(),hipMemcpyDeviceToHost);
+      hipMemcpy(r.data(),s.out8.p,r.size(),hipMemcpyDeviceToHost);
+      char path[256];std::snprintf(path,sizeof path,"/tmp/opencode/f8-dump-%s-%d.bin",dump,id);
+      std::ofstream f(path,std::ios::binary);f.write((const char*)d.data(),d.size());f.write((const char*)r.data(),r.size());
+     }
+    }
     // Intermediate blocks can publish only the f8/f16 sibling consumed by the next
     // block; the f32 raster is materialized for the last block, pool/post-merge, or trace.
     if(!write_f32_out) return;
@@ -206,17 +301,28 @@ struct Network70::Impl {
   s.create();trace_stats.alloc(71*256*3*4);trace_bits.alloc(71*256*2*4);
   hip_check(hipStreamCreate(&stream),"network stream");hip_check(hipEventCreate(&ev0),"network event0");hip_check(hipEventCreate(&ev1),"network event1");ready=true;
  }
- void run(const float* input,float* output,uint seed,const float* host_history){
-  if(!ready||!input||!output)throw std::runtime_error("network not ready/null buffers");
+  void run(const float* input,float* output,uint seed,const float* host_history,bool input_on_gpu,bool output_on_gpu=false){
+    if(!ready||!input||!output)throw std::runtime_error("network not ready/null buffers");
   StreamScope scope(stream);bool tracing=std::getenv("DLSS5_HIP_TRACE")&&std::string(std::getenv("DLSS5_HIP_TRACE"))!="0";
   if(host_history){
    if(!history.p)history.alloc(size_t(N)*16);
    hip_check(hipMemcpyAsync(history.p,host_history,size_t(N)*16,hipMemcpyHostToDevice,stream),"history upload");
   }
   counts.fill(0);for(auto&t:trace)t=Trace{};
-  auto mark=[&](int id,const float* data,uint count){++counts[id];trace[id].elements=count;if(tracing)launch_trace_f32(data,count,trace_stats.as<float>()+id*768,trace_bits.as<uint>()+id*512);};
-  hip_check(hipMemcpyAsync(rgb.p,input,1920ull*1080*16,hipMemcpyHostToDevice,stream),"input upload");hip_check(hipEventRecord(ev0,stream),"start");
-  launch_rgb_graph(rgb.as<float>(),color.as<float>(),tiles.as<float>(),W,1080,W,Ht);
+  auto mark=[&](int id,const float* data,uint count){++counts[id];trace[id].elements=count;if(tracing)launch_trace_f32(data,count,trace_stats.as<float>()+id*768,trace_bits.as<uint>()+id*512);
+   if(const char* dmp=getenv("DLSS5_DUMP")){int bid=atoi(dmp);
+    if(id==bid&&count){std::vector<float> v(count);hip_check(hipMemcpyAsync(v.data(),data,count*4,hipMemcpyDeviceToHost,stream),"dump");
+     const char* tag=getenv("DLSS5_DUMP_TAG")?getenv("DLSS5_DUMP_TAG"):"x";
+     FILE* fp=fopen(((std::string("/tmp/opencode/dump_b")+std::to_string(bid)+"_")+tag+".bin").c_str(),"wb");if(fp){std::fwrite(v.data(),4,count,fp);fclose(fp);}}}};
+   if(input_on_gpu){
+     // Input is already a device buffer (the frame_encode proxy). Use it directly —
+     // no H2D upload. Bit-identical to the host path: the upload was a raw copy.
+     hip_check(hipEventRecord(ev0,stream),"start");
+     launch_rgb_graph(input,color.as<float>(),tiles.as<float>(),W,1080,W,Ht);
+   }else{
+     hip_check(hipMemcpyAsync(rgb.p,input,1920ull*1080*16,hipMemcpyHostToDevice,stream),"input upload");hip_check(hipEventRecord(ev0,stream),"start");
+     launch_rgb_graph(rgb.as<float>(),color.as<float>(),tiles.as<float>(),W,1080,W,Ht);
+   }
   launch_prefix_h(tiles.as<float>(),prefix_w.as<float>(),host_history?history.as<float>():nullptr,s.a.as<float>(),s.a16.as<__half>(),seed,W,Ht,host_history?1:0);
    blocks[0].window(s.a.as<float>(),s.a.as<float>(),s,nullptr,false,s.a16.as<__half>(),false);
    // Block 0 p1 writes H(v) in f16 (C32 path); crop from the f16 window raster.
@@ -247,8 +353,9 @@ struct Network70::Impl {
   launch_post_merge_f32_h(src,skip[0].as<float>(),post_sc.as<float>(),dst,s.out16.as<__half>(),W,Ht,true);std::swap(src,dst);
   blocks[70].run(src,dst,s,nullptr,false,s.out16.as<__half>(),false,true,false);std::swap(src,dst);mark(70,src,N*32);
   launch_head_f32(src,head_rgb.as<float>(),color.as<float>(),out.as<float>(),N);
-  hip_check(hipGetLastError(),"network launches");hip_check(hipEventRecord(ev1,stream),"end");
-  hip_check(hipMemcpyAsync(output,out.p,size_t(N)*12,hipMemcpyDeviceToHost,stream),"output download");hip_check(hipStreamSynchronize(stream),"network completion");hip_check(hipEventElapsedTime(&gpu_ms,ev0,ev1),"GPU elapsed");
+   hip_check(hipGetLastError(),"network launches");hip_check(hipEventRecord(ev1,stream),"end");
+   if(output_on_gpu){if(output!=out.p)hip_check(hipMemcpyAsync(output,out.p,size_t(N)*12,hipMemcpyDeviceToDevice,stream),"output d2d");hip_check(hipStreamSynchronize(stream),"network completion");hip_check(hipEventElapsedTime(&gpu_ms,ev0,ev1),"GPU elapsed");}
+   else{hip_check(hipMemcpyAsync(output,out.p,size_t(N)*12,hipMemcpyDeviceToHost,stream),"output download");hip_check(hipStreamSynchronize(stream),"network completion");hip_check(hipEventElapsedTime(&gpu_ms,ev0,ev1),"GPU elapsed");}
   if(tracing){std::vector<float> stats(71*768);std::vector<uint> bits(71*512);trace_stats.download(stats.data(),stats.size()*4);trace_bits.download(bits.data(),bits.size()*4);
    bool bad=false;for(int b=0;b<71;++b){auto&t=trace[b];t.minimum=INFINITY;t.maximum=-INFINITY;t.checked=true;
     for(int l=0;l<256;++l){t.minimum=std::min(t.minimum,stats[b*768+l*3]);t.maximum=std::max(t.maximum,stats[b*768+l*3+1]);t.sum+=stats[b*768+l*3+2];t.nonfinite+=bits[b*512+l*2];t.hash^=bits[b*512+l*2+1];}
@@ -260,7 +367,9 @@ struct Network70::Impl {
 Network70::Network70():impl(new Impl){}
 Network70::~Network70()=default;
 void Network70::create(const std::string&dir){auto next=std::make_unique<Impl>();next->create(dir);impl.swap(next);}
-void Network70::run(const float* in,float* out,uint seed,const float* host_history){std::lock_guard<std::mutex> lock(impl->mutex);try{impl->run(in,out,seed,host_history);}catch(...){if(impl->stream)(void)hipStreamSynchronize(impl->stream);throw;}}
+void Network70::run(const float* in,float* out,uint seed,const float* host_history){std::lock_guard<std::mutex> lock(impl->mutex);try{impl->run(in,out,seed,host_history,false);}catch(...){if(impl->stream)(void)hipStreamSynchronize(impl->stream);throw;}}
+ void Network70::run_gpu(const float* dev,float* out,uint seed,const float* host_history){std::lock_guard<std::mutex> lock(impl->mutex);try{impl->run(dev,out,seed,host_history,true,false);}catch(...){if(impl->stream)(void)hipStreamSynchronize(impl->stream);throw;}}
+ void Network70::run_gpu_gpu(const float* dev_in,float* dev_out,uint seed,const float* host_history){std::lock_guard<std::mutex> lock(impl->mutex);try{impl->run(dev_in,dev_out,seed,host_history,true,true);}catch(...){if(impl->stream)(void)hipStreamSynchronize(impl->stream);throw;}}
 float Network70::last_gpu_ms()const{return impl->gpu_ms;}
 std::array<uint,71> Network70::last_block_counts()const{return impl->counts;}
 std::array<Network70::Trace,71> Network70::last_trace()const{return impl->trace;}
