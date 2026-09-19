@@ -163,10 +163,13 @@ class NativeHipLive {
             if(bypass()){Log("processed",frame,"F6 bypass; original input");return 0;}
             try {
                 const bool use_host=!shared_mode;
+                // temporal_gen = the F6 bypass generation: any change (a bypass
+                // toggle) resets the bridge's temporal blend so it never mixes a
+                // network frame with a pre-bypass (or non-network) previous frame.
                 if(owner->client->RunFrameRaw(use_host?in_host:in_handle,use_host?out_host:out_handle,
                                               width,height,dxgi,
                                               owner->fixed_seed!=0xFFFFFFFFu?owner->fixed_seed:unsigned(frame),
-                                              owner->display_srgb,use_host,buf_gen)){
+                                              owner->display_srgb,use_host,buf_gen,unsigned(generation))){
                     // out_buf still holds the prefix in->out copy (original pixels).
                     Log("processed",frame,"HIP failed; original input");return 0;
                 }

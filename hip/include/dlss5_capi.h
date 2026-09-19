@@ -80,6 +80,10 @@ typedef struct Dlss5FrameRaw {
     /* Import-cache generation: bump whenever the handles are recreated (kernel
        object handle values can be reused; the cache must not alias them). */
     dlss5_u32 handle_gen;
+    /* Temporal-blend continuity token: any change resets the bridge's previous-frame
+       blend buffer (e.g. the add-on's F6 bypass generation). 0 = no temporal blend
+       continuity tracking by the caller. */
+    dlss5_u32 temporal_gen;
 } Dlss5FrameRaw;
 typedef struct Dlss5HipFrameBridge {
     unsigned long long magic;

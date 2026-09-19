@@ -367,6 +367,16 @@ void launch_rgb_to_pix(const float* rgb, const uint8_t* alpha_src, uint8_t* out,
   hip_check(hipGetLastError(), "launch rgb_to_pix");
 }
 
+// Temporal blend (shimmer fix): cur = (1-w)*cur + w*prev over n floats, GPU-resident.
+// w in [0,1); w=0 is skipped (no launch). See k_gc_temporal_blend for the contract.
+void launch_temporal_blend(float* cur, const float* prev, int n, float w) {
+  if (w <= 0.f) return;
+  const int block = 256;
+  const int grid = (n + block - 1) / block;
+  k_gc_temporal_blend<<<grid, block, 0, raw_stream()>>>(cur, prev, n, w);
+  hip_check(hipGetLastError(), "launch temporal blend");
+}
+
 // Guards the 1920x1080 RGB result: non-finite (all formats) or non-representable as
 // half (rgba16_float), mirroring the CPU pre-passes that bypass the whole frame.
 bool guard_result_f32(const float* dev, size_t n, bool need_half_repr) {

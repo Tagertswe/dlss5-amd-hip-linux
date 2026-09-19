@@ -55,6 +55,13 @@ struct FrameBuffers {
     size_t raw_in_size=0;
     std::vector<float> host_proxy,host_neural,host_warped,host_result;
     bool history_valid=false;
+    // Temporal blend (shimmer fix): previous-frame decoded 1920x1080 RGB, plus the
+    // continuity tokens that reset it (geometry gen, add-on F6 temporal gen).
+    dlss5::DeviceBuf prev_out;
+    bool prev_valid=false;
+    dlss5_u32 prev_handle_gen=0;
+    dlss5_u32 prev_temporal_gen=0;
+    bool prev_seeded=false;
     dlss5_u32 previous_flags=0;
     float previous_white=0;
     void create() {
@@ -62,11 +69,32 @@ struct FrameBuffers {
         // neural must hold the network's full 1920x1152 RGB output; only the first
         // 1920x1080 rows are consumed (same as the CPU path's first n*12 bytes).
         source.alloc(n*16);proxy.alloc(n*16);neural.alloc(padded*12);decoded.alloc(n*12);history.alloc(n*12);
+        prev_out.alloc(n*12);
         warped.alloc(padded*16);base.alloc(padded*16);
         host_proxy.resize(n*4);host_neural.resize(padded*3);host_warped.resize(padded*4);host_result.resize(n*3);
     }
 };
 static std::unique_ptr<FrameBuffers> g_frame;
+
+// Temporal blend weight (previous-frame share) for the non-temporal live path. Read
+// once from the environment; 0 disables the blend (legacy bit-exact behavior). The
+// default is 0.0 so the offline raw pipeline stays bit-exact unless the caller (the
+// in-game wrapper) opts in via DLSS5_TEMPORAL_BLEND.
+static double temporal_blend_weight() {
+    static const double w = [] {
+        const char* e = getenv("DLSS5_TEMPORAL_BLEND");
+        double v = 0.0;
+        if (e && e[0]) {
+            char* end = nullptr;
+            const double p = strtod(e, &end);
+            if (end && end != e) v = p;
+        }
+        if (v < 0.0) v = 0.0;
+        if (v > 0.999999) v = 0.999999;
+        return v;
+    }();
+    return w;
+}
 
 static void run_log(const char* s) {
     FILE* f = fopen("/tmp/dlss5-hip-run.log", "a");
@@ -308,6 +336,12 @@ extern "C" int dlss5_run_frame_raw_gpu(const Dlss5FrameRaw* f) {
         dlss5::hip_check(hipSetDevice(g_gpu),"raw frame device");
         if (!g_frame) {auto next=std::make_unique<FrameBuffers>();next->create();g_frame=std::move(next);}
         auto& b=*g_frame;
+        // Reset the temporal blend when the geometry generation or the add-on's
+        // continuity token (F6 bypass generation) changes, or on the first frame.
+        if (!b.prev_seeded||f->handle_gen!=b.prev_handle_gen||f->temporal_gen!=b.prev_temporal_gen)
+            b.prev_valid=false;
+        b.prev_seeded=true;b.prev_handle_gen=f->handle_gen;b.prev_temporal_gen=f->temporal_gen;
+        const float blend_w=float(temporal_blend_weight());
         const bool dev_ptrs=(f->flags & DLSS5_HIP_RAW_FLAGS_DEV_PTRS)!=0;
         const bool host_ptrs=(f->flags & DLSS5_HIP_RAW_FLAGS_HOST_PTRS)!=0;
         const size_t bytes=size_t(f->width)*f->height*((f->dxgi_format==28||f->dxgi_format==87)?4u:8u);
@@ -332,7 +366,10 @@ extern "C" int dlss5_run_frame_raw_gpu(const Dlss5FrameRaw* f) {
         }
         const auto fmt=dlss5::gpu::format_from_dxgi(f->dxgi_format);
         auto bypass=[&]() {
-            // CPU bypass semantics: keep the original pixels, alpha exact.
+            // CPU bypass semantics: keep the original pixels, alpha exact. A bypassed
+            // frame is not a network output: invalidate the blend history so the next
+            // frame does not mix with a stale (or non-network) previous frame.
+            b.prev_valid=false;
             if (host_ptrs) {std::memcpy(f->out_handle,f->in_handle,bytes);}
             else {
                 dlss5::hip_check(hipMemcpy(dev_out,dev_in,bytes,hipMemcpyDeviceToDevice),"bypass copy");
@@ -356,13 +393,27 @@ extern "C" int dlss5_run_frame_raw_gpu(const Dlss5FrameRaw* f) {
         ft.mark("sync");
         if (dlss5::gpu::guard_result_f32(b.decoded.as<float>(),n*3,fmt==dlss5::gpu::FmtRgba16F))
             return bypass();
+        // Temporal blend (shimmer fix): the live path is non-temporal (history reset
+        // every frame), so the network amplifies the input's per-frame micro-variation
+        // into visible shimmer. Mixing in the previous frame's decoded RGB low-passes
+        // that variation. w=blend_w is the previous-frame weight (0 disables it).
+        if (blend_w>0.f) {
+            const size_t bn=n*3;
+            if (b.prev_valid) {
+                dlss5::gpu::launch_temporal_blend(b.decoded.as<float>(),b.prev_out.as<float>(),int(bn),blend_w);
+                dlss5::hip_check(hipMemcpy(b.prev_out.p,b.decoded.p,bn*4,hipMemcpyDeviceToDevice),"blend prev update");
+            } else {
+                dlss5::hip_check(hipMemcpy(b.prev_out.p,b.decoded.p,bn*4,hipMemcpyDeviceToDevice),"blend prev init");
+            }
+            b.prev_valid=true;
+        }
         dlss5::gpu::launch_rgb_to_pix(b.decoded.as<float>(),(const uint8_t*)dev_in,(uint8_t*)dev_out,f->width,f->height,f->dxgi_format);
         ft.mark("conv_out");
         dlss5::hip_check(hipStreamSynchronize(nullptr),"raw frame out");
         if (host_ptrs) dlss5::hip_check(hipMemcpy(f->out_handle,dev_out,bytes,hipMemcpyDeviceToHost),"raw output d2h");
         ft.mark("sync_out");
         g_err.clear();return 0;
-    } catch(const std::exception&e) {set_err(e.what());return -1;}
+    } catch(const std::exception&e) {if(g_frame)g_frame->prev_valid=false;set_err(e.what());return -1;}
 }
 
 __attribute__((constructor)) static void dlss5_hip_publish(void) {

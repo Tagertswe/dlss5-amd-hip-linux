@@ -201,5 +201,17 @@ __global__ void k_gc_prescan_rgb16f(const float* __restrict__ p, int n, unsigned
   if (i < n && (!isfinite(p[i]) || ((gc_f2h(p[i]) & 0x7c00u) == 0x7c00u))) *bad = 1u;
 }
 
+// Temporal blend (shimmer fix for the non-temporal live path): cur = (1-w)*cur + w*prev
+// elementwise over n floats. w is the previous-frame weight in [0,1); w=0 is a no-op.
+// This is a post-network smoothing stage, intentionally outside the 71-block bit-exact
+// contract (it only runs on the in-game raw path, never in the offline bench).
+__global__ void k_gc_temporal_blend(float* __restrict__ cur, const float* __restrict__ prev, int n, float w) {
+  const int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i < n) {
+    const float c = cur[i], p = prev[i];
+    cur[i] = (1.f - w) * c + w * p;
+  }
+}
+
 }  // namespace gpu
 }  // namespace dlss5
