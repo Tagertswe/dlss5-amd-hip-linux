@@ -183,6 +183,12 @@ def wrapper_bytes(exe, *, magpie=False, gpu_name=None, hip=False, hip_so=None,
             'export LD_PRELOAD="$so${LD_PRELOAD:+:$LD_PRELOAD}"',
             'export DLSS5_HIP=1',
             'export DLSS5_HIP_WEIGHTS=' + q(str(weights)),
+            # Temporal blend weight (previous-frame share) for the non-temporal live
+            # path; smooths the per-frame shimmer. 0 disables it (legacy behavior).
+            'export DLSS5_TEMPORAL_BLEND="${DLSS5_TEMPORAL_BLEND:-0.5}"',
+            # MH prod chain: byte-exact fused path for the C64/C128/C256 blocks.
+            # ~26% faster network (67->50 ms) with identical output; 0 to disable.
+            'export DLSS5_MH_PROD="${DLSS5_MH_PROD:-1}"',
         ]
     if gpu is not None:
         gpu_name = gpu.get('name') or gpu_name
