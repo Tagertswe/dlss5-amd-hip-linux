@@ -312,6 +312,12 @@ extern "C" int dlss5_run_frame_raw_gpu(const Dlss5FrameRaw* f) {
         const bool host_ptrs=(f->flags & DLSS5_HIP_RAW_FLAGS_HOST_PTRS)!=0;
         const size_t bytes=size_t(f->width)*f->height*((f->dxgi_format==28||f->dxgi_format==87)?4u:8u);
         void* dev_in=nullptr,* dev_out=nullptr;
+        {
+            char line[192];
+            snprintf(line,sizeof line,"raw_gpu w=%u h=%u dxgi=%u flags=0x%x gen=%u in=%p out=%p bytes=%zu",
+                     f->width,f->height,f->dxgi_format,f->flags,f->handle_gen,f->in_handle,f->out_handle,bytes);
+            run_log(line);
+        }
         if (dev_ptrs) {dev_in=f->in_handle;dev_out=f->out_handle;}
         else if (host_ptrs) {
             // CPU-mapped D3D12 READBACK/UPLOAD buffers: stage packed pixels on the GPU.

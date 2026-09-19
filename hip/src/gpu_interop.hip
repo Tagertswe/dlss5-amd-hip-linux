@@ -18,6 +18,8 @@
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <unistd.h>
+#include <cstdarg>
+#include <cstdio>
 #include <cstring>
 #include <mutex>
 #include <vector>
@@ -42,6 +44,17 @@ Fmt format_from_dxgi(unsigned format) {
 
 namespace {
 
+static void interop_log(const char* fmt, ...) {
+  FILE* f = fopen("/tmp/dlss5-hip-run.log", "a");
+  if (!f) return;
+  va_list ap;
+  va_start(ap, fmt);
+  vfprintf(f, fmt, ap);
+  va_end(ap);
+  fputc('\n', f);
+  fclose(f);
+}
+
 // ---------------- Win32 handle -> dma-buf fd (ported from the portable bridge) ----------------
 
 typedef int (*wine_h2fd_t)(void*, unsigned, int*, unsigned*);
@@ -56,6 +69,7 @@ wine_h2fd_t resolve_h2fd() {
   void* h = dlopen("ntdll.so", RTLD_NOW | RTLD_NOLOAD | RTLD_GLOBAL);
   if (!h) h = dlopen("ntdll.so", RTLD_NOW | RTLD_GLOBAL);
   if (h) fn = (wine_h2fd_t)dlsym(h, "wine_server_handle_to_fd");
+  interop_log("resolve_h2fd %s", fn ? "ok" : "missing");
   return fn;
 }
 
@@ -69,9 +83,11 @@ void* elf_local_sym(void* handle, const char* name) {
   const ElfW(Shdr)* strtab = nullptr;
   const ElfW(Sym)* sym;
   const char* strs;
+  const char* map_bytes;
   void* map;
   void* found = nullptr;
   int fd, i, n;
+  size_t file_size;
 
   if (!handle || !name) return nullptr;
   if (dlinfo(handle, RTLD_DI_LINKMAP, &lm) != 0 || !lm || !lm->l_name || !lm->l_name[0]) return nullptr;
@@ -81,12 +97,18 @@ void* elf_local_sym(void* handle, const char* name) {
     close(fd);
     return nullptr;
   }
-  map = mmap(nullptr, (size_t)st.st_size, PROT_READ, MAP_PRIVATE, fd, 0);
+  file_size = (size_t)st.st_size;
+  map = mmap(nullptr, file_size, PROT_READ, MAP_PRIVATE, fd, 0);
   close(fd);
   if (map == MAP_FAILED) return nullptr;
+  map_bytes = (const char*)map;
   eh = (const ElfW(Ehdr)*)map;
   if (memcmp(eh->e_ident, ELFMAG, SELFMAG) != 0) goto out;
-  sh = (const ElfW(Shdr)*)((const char*)map + eh->e_shoff);
+  if (eh->e_shentsize != sizeof(ElfW(Shdr))) goto out;
+  if (eh->e_shoff > file_size ||
+      (size_t)eh->e_shnum * sizeof(ElfW(Shdr)) > file_size - eh->e_shoff)
+    goto out;
+  sh = (const ElfW(Shdr)*)(map_bytes + eh->e_shoff);
   for (i = 0; i < eh->e_shnum; i++) {
     if (sh[i].sh_type == SHT_SYMTAB) {
       symtab = &sh[i];
@@ -95,18 +117,24 @@ void* elf_local_sym(void* handle, const char* name) {
     }
   }
   if (!symtab || !strtab || !symtab->sh_entsize) goto out;
-  strs = (const char*)map + strtab->sh_offset;
-  sym = (const ElfW(Sym)*)map + symtab->sh_offset;
+  if (symtab->sh_entsize != sizeof(ElfW(Sym))) goto out;
+  if (symtab->sh_offset > file_size || symtab->sh_size > file_size - symtab->sh_offset) goto out;
+  if (strtab->sh_offset > file_size || strtab->sh_size > file_size - strtab->sh_offset) goto out;
+  strs = map_bytes + strtab->sh_offset;
+  // Byte offset, not Elf_Sym index: `(Elf_Sym*)map + sh_offset` walks off the mmap
+  // and SIGSEGVs (in-game crash #2: RIP in this .so, RSI near .rodata symbol name).
+  sym = (const ElfW(Sym)*)(map_bytes + symtab->sh_offset);
   n = (int)(symtab->sh_size / symtab->sh_entsize);
   for (i = 0; i < n; i++) {
     if (!sym[i].st_name || ELF64_ST_TYPE(sym[i].st_info) != STT_FUNC) continue;
+    if (sym[i].st_name >= strtab->sh_size) continue;
     if (strcmp(strs + sym[i].st_name, name) == 0) {
       found = (char*)lm->l_addr + sym[i].st_value;
       break;
     }
   }
 out:
-  munmap(map, (size_t)st.st_size);
+  munmap(map, file_size);
   return found;
 }
 
@@ -133,6 +161,8 @@ int d3dkmt_handle_to_fd(void* nt_handle) {
       get_fd = (d3dkmt_object_get_fd_t)elf_local_sym(h, "d3dkmt_object_get_fd");
       destroy_res = (d3dkmt_destroy_resource_t)elf_local_sym(h, "d3dkmt_destroy_resource");
     }
+    interop_log("d3dkmt resolve win32u=%p open=%p get_fd=%p destroy=%p", h, (void*)open_res, (void*)get_fd,
+                (void*)destroy_res);
   }
   if (!open_res || !get_fd) return -1;
   local = open_res(0, nt_handle, &mutex, &sync);
@@ -142,17 +172,78 @@ int d3dkmt_handle_to_fd(void* nt_handle) {
   return fd;
 }
 
+// Wine dxgkrnl IOCTL used by winevulkan get_shared_resource_fd: turn a
+// D3DKMT/dxgk NT shared handle (FD_TYPE_INVALID / STATUS_BAD_DEVICE_TYPE)
+// into a file-type NT handle that wine_server_handle_to_fd can unwrap.
+static constexpr unsigned kDxgkGetSharedResourceFd = 0x23400Cu;
+
+typedef int (*nt_ioctl_fn)(void* handle, void* event, void* apc, void* apc_ctx, void* iosb, unsigned code,
+                           void* in_buf, unsigned in_len, void* out_buf, unsigned out_len);
+typedef int (*nt_close_fn)(void* handle);
+
+int dxgk_handle_to_fd(void* handle, wine_h2fd_t h2fd) {
+  static nt_ioctl_fn ioctl;
+  static nt_close_fn nt_close;
+  static bool tried;
+  struct {
+    long status;
+    unsigned long information;
+  } iosb{};
+  int file_handle32 = -1;
+  int st, unix_fd = -1;
+  void* file_handle;
+  if (!handle || !h2fd) return -1;
+  if (!tried) {
+    tried = true;
+    void* ntdll = dlopen("ntdll.so", RTLD_NOW | RTLD_NOLOAD);
+    if (!ntdll) ntdll = dlopen("ntdll.so", RTLD_NOW);
+    if (ntdll) {
+      ioctl = (nt_ioctl_fn)dlsym(ntdll, "NtDeviceIoControlFile");
+      nt_close = (nt_close_fn)dlsym(ntdll, "NtClose");
+    }
+    interop_log("dxgk ioctl=%p NtClose=%p", (void*)ioctl, (void*)nt_close);
+  }
+  if (!ioctl || !nt_close) return -1;
+  st = ioctl(handle, nullptr, nullptr, nullptr, &iosb, kDxgkGetSharedResourceFd, nullptr, 0, &file_handle32, 4);
+  interop_log("dxgk ioctl handle=%p st=0x%x out=0x%x iosb=0x%lx", handle, (unsigned)st, (unsigned)file_handle32,
+              (unsigned long)iosb.status);
+  if (st != 0 || file_handle32 == -1 || file_handle32 == 0) return -1;
+  file_handle = (void*)(intptr_t)file_handle32;
+  st = h2fd(file_handle, 0x0001u, &unix_fd, nullptr);
+  nt_close(file_handle);
+  interop_log("dxgk h2fd file=%p st=0x%x fd=%d", file_handle, (unsigned)st, unix_fd);
+  if (st != 0 || unix_fd < 0) return -1;
+  return unix_fd;
+}
+
 int handle_to_fd(void* handle) {
   int unix_fd = -1;
   unsigned options = 0;
   wine_h2fd_t h2fd = resolve_h2fd();
+  // winevulkan imports OPAQUE_WIN32 with FILE_READ_DATA (0x1), not GENERIC_READ
+  // (0x80000000). GENERIC_* is not granted on D3DKMT NT shared objects, so the
+  // old mask failed and fell through into the win32u .symtab scanner.
+  static const unsigned accesses[] = {
+      0x0001u,                    // FILE_READ_DATA
+      0x0003u,                    // FILE_READ_DATA | FILE_WRITE_DATA
+      0x00100000u,                // SYNCHRONIZE
+      0x00000000u,                // any granted access
+      0x80000000u | 0x40000000u,  // GENERIC_READ | GENERIC_WRITE (legacy)
+      0x80000000u,                // GENERIC_READ
+  };
+  unix_fd = dxgk_handle_to_fd(handle, h2fd);
+  if (unix_fd >= 0) return unix_fd;
   if (h2fd) {
-    int st = h2fd(handle, 0x80000000u | 0x40000000u, &unix_fd, &options);
-    if (st != 0 || unix_fd < 0) st = h2fd(handle, 0x10000000u | 0x80000000u | 0x40000000u, &unix_fd, &options);
-    if (st != 0 || unix_fd < 0) st = h2fd(handle, 0x80000000u, &unix_fd, &options);
-    if (st != 0 || unix_fd < 0) unix_fd = -1;
+    for (unsigned a : accesses) {
+      unix_fd = -1;
+      options = 0;
+      int st = h2fd(handle, a, &unix_fd, &options);
+      interop_log("h2fd handle=%p access=0x%x st=0x%x fd=%d opt=%u", handle, a, (unsigned)st, unix_fd, options);
+      if (st == 0 && unix_fd >= 0) return unix_fd;
+    }
   }
-  if (unix_fd < 0) unix_fd = d3dkmt_handle_to_fd(handle);
+  unix_fd = d3dkmt_handle_to_fd(handle);
+  interop_log("d3dkmt handle=%p fd=%d", handle, unix_fd);
   return unix_fd;
 }
 
@@ -180,15 +271,27 @@ bool map_device(void* handle, size_t size, uint32_t generation, void** dev) {
       return true;
     }
   int fd = handle_to_fd(handle);
-  if (fd < 0) return false;
+  if (fd < 0) {
+    interop_log("map_device handle=%p size=%zu gen=%u: no fd", handle, size, generation);
+    return false;
+  }
+  off_t fd_size = lseek(fd, 0, SEEK_END);
+  if (fd_size > 0 && (size_t)fd_size < size) {
+    interop_log("map_device handle=%p fd=%d dmabuf=%lld < need=%zu", handle, fd, (long long)fd_size, size);
+    close(fd);
+    return false;
+  }
   hipExternalMemoryHandleDesc d{};
   d.type = hipExternalMemoryHandleTypeOpaqueFd;
   d.handle.fd = dup(fd);
   close(fd);
   if (d.handle.fd < 0) return false;
-  d.size = size;
+  d.size = (fd_size > 0 && (size_t)fd_size > size) ? (size_t)fd_size : size;
   hipExternalMemory_t ext = nullptr;
-  if (hipImportExternalMemory(&ext, &d) != hipSuccess) {
+  hipError_t err = hipImportExternalMemory(&ext, &d);
+  if (err != hipSuccess) {
+    interop_log("hipImportExternalMemory fd=%d size=%zu err=%d %s", d.handle.fd, (size_t)d.size, (int)err,
+                hipGetErrorString(err));
     close(d.handle.fd);
     return false;
   }
@@ -196,11 +299,15 @@ bool map_device(void* handle, size_t size, uint32_t generation, void** dev) {
   bd.offset = 0;
   bd.size = size;
   void* ptr = nullptr;
-  if (hipExternalMemoryGetMappedBuffer(&ptr, ext, &bd) != hipSuccess || !ptr) {
-    hipDestroyExternalMemory(ext);
+  err = hipExternalMemoryGetMappedBuffer(&ptr, ext, &bd);
+  if (err != hipSuccess || !ptr) {
+    interop_log("hipExternalMemoryGetMappedBuffer size=%zu err=%d %s", size, (int)err, hipGetErrorString(err));
+    (void)hipDestroyExternalMemory(ext);
     close(d.handle.fd);
     return false;
   }
+  interop_log("map_device ok handle=%p gen=%u fd=%d map_size=%zu buf=%zu dev=%p", handle, generation, d.handle.fd,
+              (size_t)d.size, size, ptr);
   g_imports.push_back({handle, size, generation, d.handle.fd, ext, ptr});
   *dev = ptr;
   return true;

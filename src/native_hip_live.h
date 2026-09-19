@@ -149,7 +149,9 @@ class NativeHipLive {
                 Log("queue_conflict",frame,"callback rejected before GPU frame");return -1;
             }
             std::unique_lock<std::mutex> serial(owner->processing,std::try_to_lock);
-            if(!serial.owns_lock())return -1;
+            // Prefix already copied original pixels to out_buf. A busy skip must
+            // return 0 so vkd3d submits the suffix; -1 marks the device lost.
+            if(!serial.owns_lock()){Log("busy",frame,"previous HIP frame still running; original input");return 0;}
             if(FAILED(resources.device->GetDeviceRemovedReason()))return -1;
             if(!owner->client||!owner->client->HasRawGpu()){
                 Log("processed",frame,"V3 raw bridge missing; original input");return 0;
