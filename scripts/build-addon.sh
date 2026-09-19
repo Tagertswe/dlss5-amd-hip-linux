@@ -20,15 +20,14 @@ for probe_unit in hook trampoline buffer hde/hde64; do
   x86_64-w64-mingw32-gcc -O2 -I"$probe_minhook_dir/include" -I"$probe_minhook_dir/src" -c "$probe_minhook_dir/src/$probe_unit.c" -o "$probe_object"
   probe_objects+=("$probe_object")
 done
-# ReShade's Windows SDK include spelling is case-sensitive on Linux.
-probe_win_h=
-for probe_inc in \
-  /usr/x86_64-w64-mingw32/include/windows.h \
-  "$(x86_64-w64-mingw32-g++ -print-file-name=include 2>/dev/null)/windows.h" \
-  "$(dirname "$(command -v x86_64-w64-mingw32-g++)")/../x86_64-w64-mingw32/include/windows.h"; do
-  [ -f "$probe_inc" ] && probe_win_h=$probe_inc && break
-done
-[ -n "$probe_win_h" ] || { echo "windows.h not found for mingw cross compiler" >&2; exit 2; }
+# ReShade's Windows SDK include spelling is case-sensitive on Linux. Let the
+# compiler itself resolve windows.h (-H trace): distro layouts differ
+# (Ubuntu: /usr/x86_64-w64-mingw32/include, Fedora/Nobara: .../sys-root/mingw/include).
+probe_h_trace=$(mktemp)
+printf '#include <windows.h>\n' | x86_64-w64-mingw32-g++ -xc++ -H -E - 2>"$probe_h_trace" >/dev/null || true
+probe_win_h=$(grep 'windows\.h$' "$probe_h_trace" | awk 'NR==1{print $NF}')
+rm -f "$probe_h_trace"
+[ -n "$probe_win_h" ] && [ -f "$probe_win_h" ] || { echo "windows.h not found for mingw cross compiler" >&2; exit 2; }
 ln -s "$probe_win_h" "$probe_build_dir/Windows.h"
 # Older mingw-w64 (Ubuntu 22.04: gcc 10, win32 thread model, mingw-w64 8): std::mutex needs the -posix variant of the compiler,
 # GetTickCount64 / SRW locks need _WIN32_WINNT >= Vista, and d3d12.h lacks ID3D12SDKConfiguration (build-addon-oneclick.sh drops
