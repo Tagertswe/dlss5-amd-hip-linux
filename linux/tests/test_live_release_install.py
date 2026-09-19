@@ -21,17 +21,17 @@ class LiveReleaseInstall(unittest.TestCase):
             with patch.object(deploy, 'ensure_hip_artifacts', return_value=artifacts):
                 result = deploy.install_hip(exe, weights, acknowledge_risk=True, replace_existing=True)
             self.assertTrue(result['valid'])
-            self.assertEqual((exe.parent / 'lmxxf-d3d12.dll').read_bytes(), b'vkd3d')
+            self.assertEqual((exe.parent / 'dlss5-d3d12.dll').read_bytes(), b'vkd3d')
             self.assertEqual((exe.parent / 'd3d12core.dll').read_bytes(), b'vkd3dcore')
             self.assertIn('EnableProxyLibrary=1', ini.read_text())
-            self.assertIn('ProxyLibrary=.\\lmxxf-d3d12.dll', ini.read_text())
+            self.assertIn('ProxyLibrary=.\\dlss5-d3d12.dll', ini.read_text())
             wrapper = (exe.parent / '.dlssnr-linux/launch.sh').read_text()
             self.assertIn('version=b;', wrapper)
             self.assertNotIn('DRI_PRIME=', wrapper)
             self.assertFalse((exe.parent / 'DLSS5-AMD/continuous-every-frame.txt').exists())
             deploy.uninstall_game(exe, yes=True)
             self.assertEqual(ini.read_bytes(), original)
-            self.assertFalse((exe.parent / 'lmxxf-d3d12.dll').exists())
+            self.assertFalse((exe.parent / 'dlss5-d3d12.dll').exists())
 
 if __name__ == '__main__':
     unittest.main()

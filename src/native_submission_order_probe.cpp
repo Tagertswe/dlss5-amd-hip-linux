@@ -406,7 +406,9 @@ static DWORD WINAPI worker(void*){
   // export the ffx* API, the dispatch handler filters on the upscaler header type) or XeSS (Rise of the Ronin; its FSR is linked into the exe).
   // A host that ships an FFX dll next to its exe (Magpie: libxess.dll is loaded at startup, the FFX loader only when the FSR3/FSR4 effect
   // starts) waits for the FFX one; XeSS is taken only when no FFX dll file is present (Rise of the Ronin). DLSS5_UPSCALER=ffx|xess overrides.
- bool wait_ffx=false;{wchar_t exe[MAX_PATH]{};GetModuleFileNameW(nullptr,exe,MAX_PATH);if(wchar_t*slash=wcsrchr(exe,L'\\'))slash[1]=0;std::wstring dir=exe;wait_ffx=GetFileAttributesW((dir+L"amd_fidelityfx_dx12.dll").c_str())!=INVALID_FILE_ATTRIBUTES||GetFileAttributesW((dir+L"amd_fidelityfx_loader_dx12.dll").c_str())!=INVALID_FILE_ATTRIBUTES;}
+  bool wait_ffx=false;{wchar_t exe[MAX_PATH]{};GetModuleFileNameW(nullptr,exe,MAX_PATH);if(wchar_t*slash=wcsrchr(exe,L'\\'))slash[1]=0;std::wstring dir=exe;
+   const wchar_t*const ffx_files[]={L"amd_fidelityfx_dx12.dll",L"amd_fidelityfx_loader_dx12.dll",L"amd_fidelityfx_upscaler_dx12.dll",L"amd_fidelityfx_framegeneration_dx12.dll"};
+   for(const wchar_t*name:ffx_files)if(GetFileAttributesW((dir+name).c_str())!=INVALID_FILE_ATTRIBUTES){wait_ffx=true;break;}}
  if(const wchar_t*u=_wgetenv(L"DLSS5_UPSCALER")){if(!wcscmp(u,L"ffx"))wait_ffx=true;else if(!wcscmp(u,L"xess"))wait_ffx=false;}
  /* weights into memory while we wait for the upscaler dll / the user's hotkey (see NativePrefetchWeights) */
  {std::wstring assets=NativeLabPath(L"native-game-tiled-assets");if(GetFileAttributesW(assets.c_str())!=INVALID_FILE_ATTRIBUTES)NativePrefetchWeights(assets);}

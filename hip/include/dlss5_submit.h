@@ -1,4 +1,4 @@
-/* Private local lmxxf/vkd3d extension. No graphics waits in API callers.
+/* Private local dlss5/vkd3d extension. No graphics waits in API callers.
  * The recording caller owns the initial context ref. Accepted markers add a ref
  * held by the command allocator until its GPU work completes/reset is legal.
  * run executes on vkd3d's submission worker AFTER the prefix timeline completes,

@@ -1,1 +1,1 @@
-# Proton installer package for the lmxxf ReShade add-on.
+# Proton installer package for the dlss5-amd-hip ReShade add-on.

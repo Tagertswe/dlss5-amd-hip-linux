@@ -22,7 +22,8 @@ class TrampolineTests(unittest.TestCase):
                     '-o', dll, ROOT / 'hip/src/trampoline.c')
             exports = command('llvm-readobj', '--coff-exports', dll)
             self.assertEqual(set(re.findall(r'Name: (dlss5_\w+)', exports)),
-                             {'dlss5_init', 'dlss5_run', 'dlss5_shutdown', 'dlss5_last_error', 'dlss5_run_frame', 'dlss5_find_device'})
+                             {'dlss5_init', 'dlss5_run', 'dlss5_shutdown', 'dlss5_last_error',
+                              'dlss5_run_frame', 'dlss5_find_device', 'dlss5_run_frame_raw_gpu'})
             imports = command('llvm-readobj', '--coff-imports', dll)
             self.assertIn('GetProcAddress', imports)
             for forbidden in ('CreateFile', 'ReadFile', 'WriteFile', 'GetEnvironmentVariable'):

@@ -73,6 +73,9 @@ def main() -> None:
         'dlssnr/package.py',
         'dlssnr/addon.py',
         'dlssnr/convert_dll.py',
+        'dlssnr/runtime.py',
+        'dlssnr/assets.py',
+        'dlssnr/kernels.py',
     ]
     readme = (HERE / 'ARCHIVE-README.md').read_bytes() if (HERE / 'ARCHIVE-README.md').is_file() else (HERE / 'README.md').read_bytes()
     flags = (REPO / 'scripts' / 'game-flags.txt').read_text()
@@ -100,7 +103,7 @@ def main() -> None:
             add_file(dll, 'bin/dlss5_hip.dll')
             add_file(addon, 'bin/dlss5-amd.addon64')
             add_file(reshade, 'bin/ReShade64.dll')
-            add_file(vkd3d, 'bin/lmxxf-d3d12.dll')
+            add_file(vkd3d, 'bin/dlss5-d3d12.dll')
             add_file(vkd3dcore, 'bin/d3d12core.dll')
             for name in ('LICENSE', 'COPYING', 'AUTHORS'):
                 add_file(vkd3d_source / name, 'licenses/vkd3d-' + name)
@@ -114,7 +117,8 @@ def main() -> None:
             add_file(minhook_lic, 'licenses/MinHook-LICENSE.txt')
             for notice in sorted((HERE / 'vendor' / 'notices').glob('*')):
                 add_file(notice, 'licenses/' + notice.name)
-            manifest = {'schema': 1, 'purpose': 'slow experimental HIP proof of concept; optimization required',
+            manifest = {'schema': 1, 'version': '1.0', 'minimum_glibc': '2.34',
+                        'purpose': 'experimental native HIP DLSS5 network; per-frame optimization ongoing',
                         'source_url': 'https://github.com/guentra/dlss5-amd-hip-linux/tree/main',
                         'gameplay_verified': False, 'nvidia_equivalence_verified': False,
                         'files': records}

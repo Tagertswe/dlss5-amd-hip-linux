@@ -1,4 +1,4 @@
-"""CPU-only pinned lmxxf coefficient decoding (stdlib).
+"""CPU-only pinned dlss5 coefficient decoding (stdlib).
 
 Strict audit extraction remains incomplete and cannot produce full-network.ok.
 Explicit amd-consumer-derived mode emits experimental reconstructed tables;
@@ -18,8 +18,8 @@ import sys
 KNOWN_NVIDIA_SHA = 'e16bcf15e16e13f527491cdf7845b2fe6521a738d8f7c9c721866a8496e1fc8e'
 UPSTREAM_COMMIT = '15799b1600d57b849597a44be53ac892b7a2faea'
 ARCHIVE_OFFSET = 0x114A160
-CACHE_VERSION = 'lmxxf-15799b1-coefficients-v2'
-DERIVED_VERSION = 'lmxxf-15799b1-amd-consumer-derived-v1'
+CACHE_VERSION = 'dlss5-15799b1-coefficients-v2'
+DERIVED_VERSION = 'dlss5-15799b1-amd-consumer-derived-v1'
 BRIDGE_HASHES = {
     'hwc-to-vit.i32':'c942210afd8ffc8a2a1e4ed81df546e5e08d4c70e20f74fdddc0fe564f224ab8',
     'vit-to-hwc.i32':'cb950400c76a6a1602ead35a817c851e552b5a301bc8e94561ed26785d1e2754',

@@ -58,7 +58,7 @@ packed-float benchmark. `HIP.md` contains source-checkout build/test details.
 ## Contents and notices
 
 `bin/` contains `libdlss5_hip.so`, `dlss5_hip.dll`, `hip-network70`,
-`dlss5-amd.addon64`, the ReShade 6.8 add-on loader, `lmxxf-d3d12.dll` and
+`dlss5-amd.addon64`, the ReShade 6.8 add-on loader, `dlss5-d3d12.dll` and
 `d3d12core.dll`. The native library
 requires ROCm installed separately. `manifest.json` records every packaged file's
 digest; it is an integrity inventory, not a test certificate.

@@ -40,7 +40,7 @@ DLSS5_CAPI_EXPORT const char *dlss5_last_error(void);
    display-sRGB; otherwise mode1 linear game color. reset invalidates history.
    Missing motion disables history for that call. Motion scales convert the
    caller's vector units into UV displacement; no sign or scale is guessed.
-   Reprojection uses lmxxf's float-only fast five-tap filter, not its alternate
+   Reprojection uses dlss5's float-only fast five-tap filter, not its alternate
    fixed-point texture/reciprocal-table implementation. */
 #define DLSS5_HIP_FRAME_MAGIC 0x3250494853534C44ULL
 #define DLSS5_HIP_FRAME_ENV "DLSS5_HIP_FRAME_BRIDGE"

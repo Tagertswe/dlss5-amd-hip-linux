@@ -1,4 +1,4 @@
-"""Cross-build lmxxf's ReShade add-on on Linux (mingw-w64)."""
+"""Cross-build dlss5's ReShade add-on on Linux (mingw-w64)."""
 from __future__ import annotations
 
 from pathlib import Path

@@ -89,6 +89,11 @@ class WeightSelectionTests(unittest.TestCase):
                      patch.object(cli, 'check_host', return_value={}), \
                      patch.object(cli.games, 'inspect_game', return_value={'exe':str(exe), 'dx12':True, 'fsr_evidence':['fixture'], 'anti_cheat_evidence':[]}), \
                      patch.object(cli, 'resolve_proton', return_value={'root':root}), \
+                     patch.object(cli, 'readonly_runtime', return_value={
+                         'library': str(root / 'rocm' / 'libamdhip64.so.7'), 'runtime_version': 70000000,
+                         'devices': [{'index': 0, 'name': 'Test GPU', 'arch': 'gfx1201',
+                                      'pci_bus_id': '0000:00:00.0', 'total_memory': 1}]}), \
+                     patch.object(cli.kernels, 'bundled_targets', return_value=frozenset(('gfx1201',))), \
                      patch.object(package, 'sha256', return_value=convert_dll.KNOWN_NVIDIA_SHA), \
                      patch.object(convert_dll, 'convert_nvidia_dll', side_effect=AssertionError('conversion in readonly CLI')), \
                      redirect_stdout(out):

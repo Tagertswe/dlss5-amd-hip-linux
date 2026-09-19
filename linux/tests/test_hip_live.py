@@ -1,5 +1,9 @@
 """Executable CPU tests: verbatim live header, real pixel/resize/identity helpers.
 Only Windows, D3D and HIP execution edges are simulated. No GPU or game.
+
+The stub emulates the V3 GPU-resident design: shared handles resolve to the
+resource's byte range, so RunFrameRaw simulates the .so writing network output
+(RGB replaced, alpha exact) directly into the out buffer.
 """
 import pathlib
 import shutil
@@ -13,6 +17,7 @@ STUB = r'''
 #include <atomic>
 #include <cassert>
 #include <chrono>
+#include <cmath>
 #include <cstdio>
 #include <cstring>
 #include <cwchar>
@@ -21,8 +26,8 @@ STUB = r'''
 #include <thread>
 #include <vector>
 #include <stdexcept>
-using UINT=unsigned;using UINT64=uint64_t;using ULONG=unsigned long;using HRESULT=int;
-using SIZE_T=size_t;using HMODULE=void*;using LPCWSTR=const wchar_t*;
+using UINT=unsigned;using UINT64=uint64_t;using ULONG=unsigned long;using DWORD=unsigned;using HRESULT=int;
+using SIZE_T=size_t;using HMODULE=void*;using LPCWSTR=const wchar_t*;using HANDLE=void*;
 #define STDMETHODCALLTYPE
 #define S_OK 0
 #define E_NOINTERFACE -1
@@ -36,7 +41,7 @@ inline bool operator==(REFIID a,REFIID b){return !memcmp(&a,&b,sizeof a);}
 struct IUnknown {virtual HRESULT QueryInterface(REFIID id,void**p){if(id==IID_IUnknown){*p=this;AddRef();return 0;}*p=nullptr;return -1;}virtual ULONG AddRef()=0;virtual ULONG Release()=0;virtual ~IUnknown()=default;};
 inline std::atomic<int> objects{0}, maps{0}, key_samples{0}, runs{0}, clients{0};
 inline std::atomic<bool> key_down{false},fail_hip{false},block_run{false},entered_run{false};
-inline bool fail_map=false,fail_private=false,accept_marker=true;inline int fail_create=0,creates=0;
+inline bool fail_map=false,fail_private=false,accept_marker=true,fail_shared=false;inline int fail_create=0,creates=0;
 inline bool srgb=false;inline int last_seed=-1;inline std::string matched_adapter;
 inline void(*desc_hook)()=nullptr;
 inline std::atomic<bool> init_entered{false},block_init{false};
@@ -44,6 +49,9 @@ inline short GetAsyncKeyState(int){++key_samples;return key_down?short(0x8000):0
 #define VK_F6 0x75
 #define GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS 4
 #define GET_MODULE_HANDLE_EX_FLAG_PIN 1
+#define GENERIC_READ 0x80000000u
+#define GENERIC_WRITE 0x40000000u
+inline int CloseHandle(HANDLE){return 1;}
 inline int GetModuleHandleExW(int,LPCWSTR,HMODULE*p){*p=(void*)1;return 1;}
 inline unsigned long GetCurrentProcessId(){return 1;}
 inline unsigned long long GetTickCount64(){return 1;}
@@ -62,28 +70,39 @@ struct IDXGIFactory4:Ref{HRESULT EnumAdapterByLuid(LUID,REFIID,void**p){*p=new I
 inline HRESULT CreateDXGIFactory1(REFIID,void**p){*p=new IDXGIFactory4;return 0;}
 using D3D12_RESOURCE_STATES=unsigned;
 constexpr unsigned D3D12_RESOURCE_STATE_COMMON=0,D3D12_RESOURCE_STATE_RENDER_TARGET=4,D3D12_RESOURCE_STATE_UNORDERED_ACCESS=8,D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE=64,D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE=128,D3D12_RESOURCE_STATE_COPY_DEST=1024,D3D12_RESOURCE_STATE_COPY_SOURCE=2048,D3D12_RESOURCE_STATE_GENERIC_READ=2755;
-constexpr unsigned D3D12_RESOURCE_DIMENSION_TEXTURE2D=3,D3D12_RESOURCE_DIMENSION_BUFFER=1,D3D12_TEXTURE_LAYOUT_ROW_MAJOR=1,D3D12_RESOURCE_FLAG_NONE=0,D3D12_RESOURCE_FLAG_ALLOW_SIMULTANEOUS_ACCESS=32,D3D12_HEAP_TYPE_READBACK=3,D3D12_HEAP_TYPE_UPLOAD=2,D3D12_HEAP_FLAG_NONE=0,D3D12_RESOURCE_BARRIER_TYPE_TRANSITION=0,D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES=~0u,D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX=0,D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT=1,D3D12_COMMAND_LIST_TYPE_DIRECT=0;
+constexpr unsigned D3D12_RESOURCE_DIMENSION_TEXTURE2D=3,D3D12_RESOURCE_DIMENSION_BUFFER=1,D3D12_TEXTURE_LAYOUT_ROW_MAJOR=1,D3D12_RESOURCE_FLAG_NONE=0,D3D12_RESOURCE_FLAG_ALLOW_SIMULTANEOUS_ACCESS=32,D3D12_HEAP_TYPE_DEFAULT=0,D3D12_HEAP_TYPE_READBACK=3,D3D12_HEAP_TYPE_UPLOAD=2,D3D12_HEAP_FLAG_NONE=0,D3D12_HEAP_FLAG_SHARED=0x10,D3D12_RESOURCE_BARRIER_TYPE_TRANSITION=0,D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES=~0u,D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX=0,D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT=1,D3D12_COMMAND_LIST_TYPE_DIRECT=0;
 struct D3D12_RESOURCE_DESC{unsigned Dimension{};UINT64 Alignment{},Width{};UINT Height{};unsigned short DepthOrArraySize{},MipLevels{};DXGI_FORMAT Format{};struct{UINT Count{},Quality{};}SampleDesc;unsigned Layout{},Flags{};};
 struct D3D12_HEAP_PROPERTIES{unsigned Type{},CPUPageProperty{},MemoryPoolPreference{},CreationNodeMask{},VisibleNodeMask{};};
 struct D3D12_PLACED_SUBRESOURCE_FOOTPRINT{UINT64 Offset{};struct{DXGI_FORMAT Format{};UINT Width{},Height{},Depth{},RowPitch{};}Footprint;};
 struct D3D12_RANGE{SIZE_T Begin{},End{};};
 struct ID3D12Device;
 struct ID3D12Resource:Ref{ID3D12Device*d;D3D12_RESOURCE_DESC desc;std::vector<unsigned char> bytes;ID3D12Resource(ID3D12Device*,D3D12_RESOURCE_DESC);~ID3D12Resource();D3D12_RESOURCE_DESC GetDesc(){if(desc_hook){auto fn=desc_hook;desc_hook=nullptr;fn();}return desc;}HRESULT GetDevice(REFIID,void**p);HRESULT Map(UINT,const D3D12_RANGE*,void**p){++maps;if(fail_map){*p=nullptr;return -1;}*p=bytes.data();return 0;}void Unmap(UINT,const D3D12_RANGE*){}};
-struct ID3D12Device:Ref{LUID GetAdapterLuid(){return {1,0};}HRESULT GetDeviceRemovedReason(){return 0;}void GetCopyableFootprints(const D3D12_RESOURCE_DESC*d,UINT,UINT,UINT64,D3D12_PLACED_SUBRESOURCE_FOOTPRINT*f,UINT*r,UINT64*b,UINT64*t){unsigned bp=(d->Format==10||d->Format==11)?8:4;f->Offset=0;f->Footprint={d->Format,UINT(d->Width),d->Height,1,UINT((d->Width*bp+255)&~255ull)};if(r)*r=d->Height;if(b)*b=d->Width*bp;*t=UINT64(f->Footprint.RowPitch)*d->Height;}HRESULT CreateCommittedResource(const D3D12_HEAP_PROPERTIES*,unsigned,const D3D12_RESOURCE_DESC*d,unsigned,const void*,REFIID,void**p){if(++creates==fail_create){*p=nullptr;return -1;}*p=new ID3D12Resource(this,*d);return 0;}};
+struct ID3D12Device:Ref{LUID GetAdapterLuid(){return {1,0};}HRESULT GetDeviceRemovedReason(){return 0;}void GetCopyableFootprints(const D3D12_RESOURCE_DESC*d,UINT,UINT,UINT64,D3D12_PLACED_SUBRESOURCE_FOOTPRINT*f,UINT*r,UINT64*b,UINT64*t){unsigned bp=(d->Format==10||d->Format==11)?8:4;f->Offset=0;f->Footprint={d->Format,UINT(d->Width),d->Height,1,UINT((d->Width*bp+255)&~255ull)};if(r)*r=d->Height;if(b)*b=d->Width*bp;*t=UINT64(f->Footprint.RowPitch)*d->Height;}HRESULT CreateCommittedResource(const D3D12_HEAP_PROPERTIES*,unsigned,const D3D12_RESOURCE_DESC*d,unsigned,const void*,REFIID,void**p){if(++creates==fail_create){*p=nullptr;return -1;}*p=new ID3D12Resource(this,*d);return 0;}HRESULT CreateSharedHandle(ID3D12Resource*r,const void*,DWORD,void*,HANDLE*h){if(fail_shared){*h=nullptr;return -1;}*h=r->bytes.data();return 0;}};
 inline ID3D12Resource::ID3D12Resource(ID3D12Device*x,D3D12_RESOURCE_DESC a):d(x),desc(a),bytes(a.Dimension==1?a.Width:a.Width*a.Height*((a.Format==10||a.Format==11)?8:4)){d->AddRef();}
 inline ID3D12Resource::~ID3D12Resource(){d->Release();}
 inline HRESULT ID3D12Resource::GetDevice(REFIID,void**p){*p=d;d->AddRef();return 0;}
 struct D3D12_RESOURCE_BARRIER{unsigned Type{},Flags{};struct{ID3D12Resource*pResource;UINT Subresource;unsigned StateBefore,StateAfter;}Transition;};
 struct D3D12_TEXTURE_COPY_LOCATION{ID3D12Resource*pResource{};unsigned Type{};D3D12_PLACED_SUBRESOURCE_FOOTPRINT PlacedFootprint{};UINT SubresourceIndex{};};
 #include "../hip/include/dlss5_submit.h"
-struct ID3D12GraphicsCommandList:Ref{ID3D12Device*d;unsigned barriers=0,copies=0,markers=0;Dlss5SubmitMarker marker{};std::map<unsigned,IUnknown*> private_refs;ID3D12Resource*readback=nullptr,*upload=nullptr,*color=nullptr;ID3D12GraphicsCommandList(ID3D12Device*x):d(x){d->AddRef();}~ID3D12GraphicsCommandList(){ResetAllocator();for(auto&entry:private_refs)entry.second->Release();d->Release();}unsigned GetType(){return 0;}HRESULT GetDevice(REFIID,void**p){*p=d;d->AddRef();return 0;}HRESULT SetPrivateDataInterface(REFIID id,const IUnknown*p){if(fail_private)return -1;auto it=private_refs.find(id.Data1);if(p)const_cast<IUnknown*>(p)->AddRef();if(it!=private_refs.end()){it->second->Release();private_refs.erase(it);}if(p)private_refs[id.Data1]=const_cast<IUnknown*>(p);return 0;}void ResourceBarrier(UINT n,const D3D12_RESOURCE_BARRIER*){barriers+=n;}void CopyTextureRegion(const D3D12_TEXTURE_COPY_LOCATION*dst,UINT,UINT,UINT,const D3D12_TEXTURE_COPY_LOCATION*src,const void*){++copies;if(dst->Type==1){readback=dst->pResource;color=src->pResource;auto f=dst->PlacedFootprint;size_t row=color->bytes.size()/color->desc.Height;for(unsigned y=0;y<color->desc.Height;y++)memcpy(readback->bytes.data()+f.Offset+y*f.Footprint.RowPitch,color->bytes.data()+y*row,row);}else upload=src->pResource;}void SetMarker(UINT meta,const void*p,UINT n){++markers;assert(meta==DLSS5_SUBMIT_METADATA&&n==sizeof(Dlss5SubmitMarker));auto&m=*static_cast<const Dlss5SubmitMarker*>(p);assert(m.magic==DLSS5_SUBMIT_MAGIC&&m.version==1&&m.bytes==n);if(accept_marker){marker=m;marker.retain(marker.context);*m.accepted=1;marker.accepted=nullptr;}}int Run(uint64_t q=42){assert(marker.context);return marker.run(marker.context,q);}void ResetAllocator(){if(marker.context){marker.release(marker.context);marker={};}}};
+struct ID3D12GraphicsCommandList:Ref{ID3D12Device*d;unsigned barriers=0,copies=0,markers=0;Dlss5SubmitMarker marker{};std::map<unsigned,IUnknown*> private_refs;ID3D12Resource*readback=nullptr,*upload=nullptr,*color=nullptr;ID3D12GraphicsCommandList(ID3D12Device*x):d(x){d->AddRef();}~ID3D12GraphicsCommandList(){ResetAllocator();for(auto&entry:private_refs)entry.second->Release();d->Release();}unsigned GetType(){return 0;}HRESULT GetDevice(REFIID,void**p){*p=d;d->AddRef();return 0;}HRESULT SetPrivateDataInterface(REFIID id,const IUnknown*p){if(fail_private)return -1;auto it=private_refs.find(id.Data1);if(p)const_cast<IUnknown*>(p)->AddRef();if(it!=private_refs.end()){it->second->Release();private_refs.erase(it);}if(p)private_refs[id.Data1]=const_cast<IUnknown*>(p);return 0;}void ResourceBarrier(UINT n,const D3D12_RESOURCE_BARRIER*){barriers+=n;}void CopyTextureRegion(const D3D12_TEXTURE_COPY_LOCATION*dst,UINT,UINT,UINT,const D3D12_TEXTURE_COPY_LOCATION*src,const void*){++copies;if(dst->Type==1){readback=dst->pResource;color=src->pResource;auto f=dst->PlacedFootprint;size_t row=color->bytes.size()/color->desc.Height;for(unsigned y=0;y<color->desc.Height;y++)memcpy(readback->bytes.data()+f.Offset+y*f.Footprint.RowPitch,color->bytes.data()+y*row,row);}else upload=src->pResource;}void CopyResource(ID3D12Resource*dst,ID3D12Resource*src){++copies;memcpy(dst->bytes.data(),src->bytes.data(),dst->bytes.size());}void SetMarker(UINT meta,const void*p,UINT n){++markers;assert(meta==DLSS5_SUBMIT_METADATA&&n==sizeof(Dlss5SubmitMarker));auto&m=*static_cast<const Dlss5SubmitMarker*>(p);assert(m.magic==DLSS5_SUBMIT_MAGIC&&m.version==1&&m.bytes==n);if(accept_marker){marker=m;marker.retain(marker.context);*m.accepted=1;marker.accepted=nullptr;}}int Run(uint64_t q=42){assert(marker.context);return marker.run(marker.context,q);}void ResetAllocator(){if(marker.context){marker.release(marker.context);marker={};}}};
 '''
 CLIENT = r'''
 #pragma once
 #include "windows.h"
 #include "native_frame_input_check.h"
 inline std::wstring NativeLabPath(const wchar_t*p){return p;}
-class NativeHipClient{public:NativeHipClient(){++clients;}~NativeHipClient(){--clients;}void Create(const char*n){matched_adapter=n;init_entered=true;while(block_init)std::this_thread::yield();}bool Ready()const{return true;}int RunFrame(const float*,float*out,unsigned seed,bool display){++runs;last_seed=int(seed);assert(display==srgb);entered_run=true;while(block_run)std::this_thread::yield();if(fail_hip)return -1;for(size_t i=0;i<size_t(1920)*1080*3;i++)out[i]=.75f;return 0;}};
+class NativeHipClient{public:NativeHipClient(){++clients;}~NativeHipClient(){--clients;}
+void Create(const char*n){matched_adapter=n;init_entered=true;while(block_init)std::this_thread::yield();}
+bool Ready()const{return true;}
+bool HasRawGpu()const{return true;}
+int RunFrameRaw(void*in,void*out,unsigned w,unsigned h,unsigned dxgi,unsigned seed,bool display,bool host_ptrs,unsigned gen){
+(void)in;(void)host_ptrs;(void)gen;++runs;last_seed=int(seed);assert(display==srgb);
+entered_run=true;while(block_run)std::this_thread::yield();
+if(fail_hip)return -1;
+unsigned bpp=(dxgi==10||dxgi==11)?8:4;
+auto*o=static_cast<unsigned char*>(out);
+for(size_t i=0;i<size_t(w)*h;i++){o[i*bpp]=191;o[i*bpp+1]=191;o[i*bpp+2]=191;}
+return 0;}};
 '''
 BODY = r'''
 #include "native_hip_live.h"
@@ -117,7 +136,7 @@ def run_cpp(body):
                                capture_output=True, text=True, timeout=40)
         if build.returncode:
             raise AssertionError('compile failed:\n' + build.stdout + build.stderr)
-        result = subprocess.run([str(tmp / 'test')], capture_output=True, text=True, timeout=30)
+        result = subprocess.run([str(tmp / 'test')], capture_output=True, text=True, timeout=60)
         if result.returncode:
             raise AssertionError('live harness failed:\n' + result.stdout + result.stderr)
 
@@ -132,10 +151,10 @@ assert(objects==0&&clients==0);
     def test_callback_network_rows_alpha_and_lifetime(self):
         run_cpp(r'''
 {Fixture f;{NativeHipLive live;ready(live,f);assert(matched_adapter=="Exact GPU Name");
-assert(f.l->copies==2&&f.l->barriers==4&&runs==0);assert(f.l->private_refs.empty());}
+assert(f.l->copies==3&&f.l->barriers==7&&runs==0);assert(f.l->private_refs.empty());}
 assert(clients==1);assert(f.l->Run()==0);assert(runs==1&&last_seed==7);
 for(unsigned y=0;y<f.c->desc.Height;y++)for(unsigned x=0;x<f.c->desc.Width;x++){
-auto*p=f.l->upload->bytes.data()+y*256+x*4;assert(p[0]==191&&p[1]==191&&p[2]==191);
+auto*p=f.l->upload->bytes.data()+y*17*4+x*4;assert(p[0]==191&&p[1]==191&&p[2]==191);
 assert(p[3]==f.c->bytes[(y*f.c->desc.Width+x)*4+3]);}
 assert(f.l->Run()!=0);assert(runs==1);f.l->ResetAllocator();assert(clients==0);}
 assert(objects==0);
@@ -147,7 +166,7 @@ assert(objects==0);
 // Hold F6: exactly one edge, one sample per Record, no extra reads in callback.
 int before=key_samples;key_down=true;assert(!record(live,f));assert(!record(live,f));
 assert(key_samples==before+2);key_down=false;assert(!record(live,f));
-key_down=true;assert(record(live,f,100));assert(f.l->Run()==0);assert(last_seed==100);}
+key_down=true;assert(record(live,f,100));assert(f.l->Run(100)==0);assert(last_seed==100);}
 assert(objects==0&&clients==0);
 ''')
 
@@ -157,17 +176,20 @@ assert(objects==0&&clients==0);
 key_down=true;assert(!record(live,f));key_down=false;assert(!record(live,f));
 key_down=true;live.Record(nullptr,nullptr,0,8);assert(key_samples==before+3);
 assert(f.l->Run()==0&&runs==0);assert(key_samples==before+3);
-for(unsigned y=0;y<f.c->desc.Height;y++)assert(!memcmp(f.l->upload->bytes.data()+y*256,f.c->bytes.data()+y*17*4,17*4));}
+for(unsigned y=0;y<f.c->desc.Height;y++)assert(!memcmp(f.l->upload->bytes.data()+y*17*4,f.c->bytes.data()+y*17*4,17*4));}
 assert(objects==0&&clients==0);
 ''')
 
-    def test_toggle_while_hip_running_rolls_back(self):
+    def test_toggle_while_hip_running_keeps_new_pixels_and_bypasses_next(self):
         run_cpp(r'''
 {Fixture f;NativeHipLive live;ready(live,f);block_run=true;
 std::thread worker([&]{assert(f.l->Run()==0);});
 while(!entered_run)std::this_thread::yield();key_down=true;assert(!record(live,f));
 block_run=false;worker.join();assert(runs==1);
-for(unsigned y=0;y<f.c->desc.Height;y++)assert(!memcmp(f.l->upload->bytes.data()+y*256,f.c->bytes.data()+y*17*4,17*4));}
+for(unsigned y=0;y<f.c->desc.Height;y++)for(unsigned x=0;x<f.c->desc.Width;x++){
+auto*p=f.l->upload->bytes.data()+y*17*4+x*4;assert(p[0]==191&&p[1]==191&&p[2]==191);}
+int before=key_samples;assert(!record(live,f));assert(!record(live,f));key_down=false;
+assert(key_samples==before+2);}
 assert(objects==0&&clients==0);
 ''')
 
@@ -175,26 +197,45 @@ assert(objects==0&&clients==0);
         run_cpp(r'''
 {Fixture f;NativeHipLive live;ready(live,f);assert(f.l->Run()==0);f.l->ResetAllocator();
 for(auto&x:f.c->bytes)x=17;fail_hip=true;assert(record(live,f,9));assert(f.l->Run()==0);
-for(unsigned y=0;y<f.c->desc.Height;y++)assert(!memcmp(f.l->upload->bytes.data()+y*256,f.c->bytes.data()+y*17*4,17*4));}
+for(unsigned y=0;y<f.c->desc.Height;y++)assert(!memcmp(f.l->upload->bytes.data()+y*17*4,f.c->bytes.data()+y*17*4,17*4));}
 assert(objects==0&&clients==0);
 ''')
 
-    def test_queue_conflict_duplicate_and_map_failure_fail_before_consumer(self):
+    def test_queue_conflict_duplicate_and_mapped_map_failure(self):
         run_cpp(r'''
-{Fixture f;NativeHipLive live;ready(live,f);assert(f.l->Run(111)==0);int before=maps;
-assert(f.l->Run(111)!=0&&maps==before);f.l->ResetAllocator();
-assert(record(live,f,8));before=maps;assert(f.l->Run(222)!=0&&maps==before);f.l->ResetAllocator();
-assert(record(live,f,9));fail_map=true;assert(f.l->Run(111)!=0);fail_map=false;}
+{Fixture f;NativeHipLive live;ready(live,f);
+assert(f.l->Run(111)==0);assert(f.l->Run(111)!=0);f.l->ResetAllocator();
+assert(record(live,f,8));assert(f.l->Run(222)!=0);f.l->ResetAllocator();
+int baseline=objects;
+// A new geometry forces buffer recreation, so the setup failures fire.
+f.c->desc.Width=15;f.c->desc.Height=21;
+fail_shared=true;fail_map=true;assert(!record(live,f,9));
+f.c->desc.Width=17;f.c->desc.Height=19;
+// Failed setup discards the buffer pair and leaks nothing else.
+fail_map=false;fail_shared=false;assert(objects==baseline-2);
+assert(record(live,f,9));assert(f.l->Run(111)==0);}
 assert(objects==0&&clients==0);
 ''')
 
     def test_failed_setup_does_not_record_or_leak(self):
         run_cpp(r'''
-{Fixture f;NativeHipLive live;ready(live,f);f.l->ResetAllocator();int baseline=objects;auto copies=f.l->copies;
-for(int n:{1,2}){creates=0;fail_create=n;assert(!record(live,f));assert(objects==baseline&&f.l->copies==copies);}
-fail_create=0;fail_map=true;assert(!record(live,f));fail_map=false;assert(objects==baseline&&f.l->copies==copies);
-fail_private=true;assert(!record(live,f));fail_private=false;assert(objects==baseline&&f.l->copies==copies);
-assert(record(live,f));assert(f.l->Run()==0);}
+{Fixture f;NativeHipLive live;ready(live,f);f.l->ResetAllocator();
+// Shared-handle failure falls back to mapped buffers; setup still succeeds.
+f.c->desc.Width=15;f.c->desc.Height=21;
+creates=0;fail_shared=true;assert(record(live,f,11));
+f.c->desc.Width=17;f.c->desc.Height=19;
+assert(f.l->Run(11)==0&&maps>=2);
+f.l->ResetAllocator();
+int baseline=objects;auto copies=f.l->copies;
+// Full failure (shared + mapped) records nothing and leaks nothing.
+f.c->desc.Width=13;f.c->desc.Height=23;creates=0;fail_shared=true;fail_map=true;
+assert(!record(live,f,12));
+f.c->desc.Width=17;f.c->desc.Height=19;fail_map=false;fail_shared=false;
+assert(objects==baseline-2&&f.l->copies==copies);
+fail_private=true;f.c->desc.Width=11;f.c->desc.Height=21;
+assert(!record(live,f,13));
+f.c->desc.Width=17;f.c->desc.Height=19;fail_private=false;assert(objects==baseline&&f.l->copies==copies);
+assert(record(live,f,14));assert(f.l->Run(11)==0);}
 assert(objects==0&&clients==0);
 ''')
 
@@ -230,7 +271,7 @@ desc.DepthOrArraySize=desc.MipLevels=desc.SampleDesc.Count=1;desc.Format=format;
 for(auto&v:f.c->bytes)v=0x31;srgb=true;NativeHipLive live;ready(live,f);assert(f.l->Run()==0);
 const unsigned bpp=format==87?4:8,alpha=bpp/4;
 for(unsigned y=0;y<19;y++)for(unsigned x=0;x<17;x++)
-assert(!memcmp(f.l->upload->bytes.data()+y*256+x*bpp+bpp-alpha,f.c->bytes.data()+(y*17+x)*bpp+bpp-alpha,alpha));}
+assert(!memcmp(f.l->upload->bytes.data()+y*17*bpp+x*bpp+bpp-alpha,f.c->bytes.data()+(y*17+x)*bpp+bpp-alpha,alpha));}
 assert(objects==0&&clients==0);
 ''')
 
@@ -274,7 +315,7 @@ assert(objects==0&&clients==0);
     def test_missing_extension_no_suffix_and_prefix_resources_retained(self):
         run_cpp(r'''
 accept_marker=false;
-{Fixture f;NativeHipLive live;ready(live,f);assert(f.l->copies==1);assert(f.l->barriers==2);
+{Fixture f;NativeHipLive live;ready(live,f);assert(f.l->copies==2);assert(f.l->barriers==3);
 assert(!f.l->private_refs.empty());assert(!record(live,f));assert(f.l->markers==1);assert(runs==0);
 assert(f.l->readback->bytes[0]==f.c->bytes[0]);}
 assert(objects==0&&clients==0);

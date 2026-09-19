@@ -112,7 +112,7 @@ def find_weights(path: Path, *, allow_derived_layouts=False) -> Path:
         return convert_nvidia_dll(root, layout_mode='amd-consumer-derived')
     if root.is_symlink() or not root.is_dir():
         raise RuntimeError(
-            'Pass a weights directory, an lmxxf package folder, or nvngx_dlssnr.dll '
+            'Pass a weights directory, an dlss5 package folder, or nvngx_dlssnr.dll '
             '(version 310.8.0.0), not a random file.'
         )
     for candidate in (
@@ -146,13 +146,13 @@ def find_weights(path: Path, *, allow_derived_layouts=False) -> Path:
                     raise RuntimeError(f'Invalid weights manifest: {exc}') from exc
             return candidate
     raise RuntimeError(
-        'No network weights (.f32/.f16/.i32) found. Pass an lmxxf package or '
+        'No network weights (.f32/.f16/.i32) found. Pass an dlss5 package or '
         'DLSS5-AMD/native-game-tiled-assets with --package / --weights.'
     )
 
 
 def validate(package: Path, *, magpie: bool = False) -> dict:
-    """Return a description of a drop-in lmxxf release directory."""
+    """Return a description of a drop-in dlss5 release directory."""
     root = Path(package).expanduser().resolve()
     files = list(iter_files(root))
     names = {_rel(root, path) for path in files}

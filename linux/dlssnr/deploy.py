@@ -1,4 +1,4 @@
-"""Copy an lmxxf user package into a game directory and write a Proton wrapper."""
+"""Copy an dlss5 user package into a game directory and write a Proton wrapper."""
 from __future__ import annotations
 
 from contextlib import contextmanager
@@ -17,6 +17,10 @@ from . import package
 
 STORE = '.dlssnr-linux'
 SCHEMA = 2
+# Files the game may rewrite between install and the next upgrade/uninstall
+# (ReShade re-saves its own settings on exit); a changed copy must not block
+# a reinstall, and install regenerates them from the proxy template anyway.
+RUNTIME_MUTABLE = {'ReShade.ini'}
 NOTES = [
     'D3D path: this deploys the ReShade add-on and package shaders without native HIP.',
     'SM 6.10 wave-matrix requires the corresponding D3D12 runtime and driver support; successful installation does not verify rendering under vkd3d-proton.',
@@ -94,7 +98,8 @@ def running_game(exe):
     return False
 
 
-def wrapper_bytes(exe, *, magpie=False, gpu_name=None, hip=False, hip_so=None):
+def wrapper_bytes(exe, *, magpie=False, gpu_name=None, hip=False, hip_so=None,
+                  gpu=None, so_digest=None, hip_library=None, hip_library_digest=None):
     store = exe.parent / STORE
     overrides = 'dxgi=n,b;d3d12=n,b;d3d12core=n,b' if magpie else 'd3d12=n,b;d3d12core=n,b'
     if hip:
@@ -105,7 +110,7 @@ def wrapper_bytes(exe, *, magpie=False, gpu_name=None, hip=False, hip_so=None):
     lines = [
         '#!/bin/bash',
         'set -euo pipefail',
-        '# Generated Proton prefix for lmxxf DLSS5-AMD (' + ('HIP diagnostic' if hip else 'D3D backend') + ').',
+        '# Generated Proton prefix for dlss5-amd-hip (' + ('HIP diagnostic' if hip else 'D3D backend') + ').',
         'if (( $# == 0 )); then',
         '  printf "%s\\n" "Usage: launch.sh RUNNER [ARGUMENTS...] (Steam: launch.sh %command%)." >&2',
         '  exit 2',
@@ -133,16 +138,34 @@ def wrapper_bytes(exe, *, magpie=False, gpu_name=None, hip=False, hip_so=None):
         'export STEAM_COMPAT_MOUNTS="${STEAM_COMPAT_MOUNTS:+$STEAM_COMPAT_MOUNTS:}"' + q(str(exe.parent)),
     ]
     if hip:
+        lines += ['so=' + q(str(so))]
+        if so_digest:
+            lines += [
+                'if [[ ! -f "$so" || ! -r "$so" ]] || ! actual=$(sha256sum < "$so") || '
+                '[[ "${actual%% *}" != ' + q(so_digest) + ' ]]; then',
+                '  printf "DLSS5: HIP library missing or changed: %s; restore it or reinstall before launching.\\n" "$so" >&2',
+                '  exit 1',
+                'fi',
+            ]
+        if hip_library:
+            library = str(hip_library)
+            lines += ['hip_library=' + q(library)]
+            if hip_library_digest:
+                lines += [
+                    'if [[ ! -f "$hip_library" || ! -r "$hip_library" ]] || ! actual=$(sha256sum < "$hip_library") || '
+                    '[[ "${actual%% *}" != ' + q(hip_library_digest) + ' ]]; then',
+                    '  printf "DLSS5: HIP runtime missing or changed: %s; restore it or reinstall before launching.\\n" "$hip_library" >&2',
+                    '  exit 1',
+                    'fi',
+                    'export LD_LIBRARY_PATH=' + q(str(Path(library).parent)) + '"${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"',
+                ]
         lines += [
-            'so=' + q(str(so)),
-            'if [[ ! -f "$so" ]]; then',
-            '  printf "DLSS5: missing HIP library: %s\\n" "$so" >&2',
-            '  exit 1',
-            'fi',
             'export LD_PRELOAD="$so${LD_PRELOAD:+:$LD_PRELOAD}"',
             'export DLSS5_HIP=1',
             'export DLSS5_HIP_WEIGHTS=' + q(str(weights)),
         ]
+    if gpu is not None:
+        gpu_name = gpu.get('name') or gpu_name
     if gpu_name:
         lines += [
             'export DXVK_FILTER_DEVICE_NAME=' + q(gpu_name),
@@ -207,8 +230,15 @@ def _journal(store, data):
 def _load(exe):
     store = _safe(exe.parent / STORE, directory=True)
     data = json.loads(_safe(store / 'manifest.json').read_text())
-    if type(data) is not dict or data.get('schema') != SCHEMA or data.get('kind') != 'lmxxf':
-        raise RuntimeError('Not an lmxxf Linux deployment journal; refusing mutation')
+    if type(data) is not dict:
+        raise RuntimeError('Not an dlss5 Linux deployment journal; refusing mutation')
+    # A terminal tombstone owns no files, so a fresh install may reset it even
+    # when an older release wrote it under a previous journal kind.
+    if (data.get('state') == 'removed' and not data.get('files')
+            and data.get('exe') in (None, str(exe))):
+        return data
+    if data.get('schema') != SCHEMA or data.get('kind') != 'dlss5':
+        raise RuntimeError('Not an dlss5 Linux deployment journal; refusing mutation')
     if data.get('exe') != str(exe):
         raise RuntimeError('Deployment journal exe mismatch')
     if type(data.get('files')) is not dict:
@@ -257,14 +287,17 @@ def status_game(exe):
         if missing:
             return {'installed': True, 'valid': False, 'pending': True,
                     'notes': ['Missing deployed files: ' + ', '.join(missing[:8])]}
-        changed = [name for name, item in data['files'].items() if _digest(exe.parent / name) != item['sha256']]
+        changed = [name for name, item in data['files'].items()
+                   if name not in RUNTIME_MUTABLE and _digest(exe.parent / name) != item['sha256']]
         if changed:
             return {'installed': True, 'valid': False, 'pending': True,
                     'notes': ['Changed deployed files: ' + ', '.join(changed[:8])]}
         return dict({'installed': True, 'valid': True, 'pending': False,
                      'hip': data.get('hip', False),
                      'notes': list(HIP_NOTES if data.get('hip', False) else NOTES),
-                     'mode': data.get('mode'), 'package': data.get('package')}, **prefix_paths(exe))
+                     'mode': data.get('mode'), 'package': data.get('package'),
+                     'weights': data.get('weights'), 'gpu': data.get('gpu'),
+                     'hip_library': data.get('hip_library')}, **prefix_paths(exe))
     except (RuntimeError, OSError, ValueError) as exc:
         return {'installed': True, 'valid': False, 'pending': True, 'notes': [str(exc)]}
 
@@ -283,7 +316,7 @@ def hip_paths():
         'so': _first_file(installer / 'bin' / 'libdlss5_hip.so', repo / 'hip' / 'libdlss5_hip.so'),
         'dll': _first_file(installer / 'bin' / 'dlss5_hip.dll', repo / 'hip' / 'dlss5_hip.dll'),
         'addon': _first_file(installer / 'bin' / 'dlss5-amd.addon64', installer / 'build' / 'dlss5-amd.addon64'),
-        'vkd3d': _first_file(installer / 'bin' / 'lmxxf-d3d12.dll', installer / 'build/live/build-vkd3d/libs/d3d12/d3d12.dll'),
+        'vkd3d': _first_file(installer / 'bin' / 'dlss5-d3d12.dll', installer / 'build/live/build-vkd3d/libs/d3d12/d3d12.dll'),
         'vkd3dcore': _first_file(installer / 'bin' / 'd3d12core.dll', installer / 'build/live/build-vkd3d/libs/d3d12core/d3d12core.dll'),
         'reshade': _first_file(
             installer / 'bin' / 'ReShade64.dll',
@@ -326,6 +359,42 @@ def _backup_original(exe, relative, files, store):
     return original
 
 
+def _prune_weights(exe, files, store, data, keep, *, remove_unmanaged):
+    """Drop superseded network tables before staging a fresh set.
+
+    Upgrading an existing install must not leave stale tables behind (a
+    foreign game's network, a superseded revision, an old manifest): the
+    runtime would mix them with the new set. Files owned by the deployment
+    journal are always pruned (digest-checked first); files the journal does
+    not own are only removed when the caller asked to replace existing files,
+    so a manual layout is never clobbered silently.
+    """
+    prefix = 'DLSS5-AMD/native-game-tiled-assets/'
+    assets = exe.parent / prefix
+    if not assets.is_dir():
+        return []
+    removed = []
+    for entry in sorted(assets.iterdir()):
+        if entry.is_symlink() or not entry.is_file():
+            continue
+        relative = prefix + entry.name
+        owned = relative in files
+        if entry.name in keep and owned:
+            continue
+        if not owned and not remove_unmanaged:
+            continue
+        if owned and _digest(entry) != files[relative]['sha256']:
+            raise RuntimeError(f'Refusing to remove a changed weights file: {relative}; uninstall first')
+        entry.unlink()
+        if owned:
+            del files[relative]
+        removed.append(relative)
+    if removed:
+        data['files'] = files
+        _journal(store, data)
+    return removed
+
+
 def _record_write(exe, relative, digest, original, files, store):
     target = exe.parent / relative
     previous = _digest(target) if target.is_file() else None
@@ -361,17 +430,21 @@ def _begin_install(exe, *, hip, mode, **metadata):
                 raise RuntimeError('Uninstall before switching deployment backend or loader mode')
             files = dict(previous['files'])
     store.mkdir(mode=0o700, exist_ok=True)
-    data = dict(schema=SCHEMA, kind='lmxxf', exe=str(exe), state='installing',
+    data = dict(schema=SCHEMA, kind='dlss5', exe=str(exe), state='installing',
                 hip=hip, mode=mode, files=files, **metadata)
     _journal(store, data)
     return data
 
 
 def install_hip(exe, weights_root, *, magpie=False, replace_existing=False,
-                acknowledge_risk=False, dry_run=False, gpu_name=None, allow_derived_layouts=False):
+                acknowledge_risk=False, dry_run=False, gpu_name=None, allow_derived_layouts=False,
+                gpu=None, hip_library=None):
     if not acknowledge_risk:
         raise RuntimeError('Explicit --accept-risk is required; this injects a ReShade add-on into the game directory')
     exe = _exe(exe)
+    if gpu is not None:
+        if type(gpu.get('index')) is not int or gpu['index'] < 0 or not isinstance(gpu.get('name'), str) or not gpu['name']:
+            raise RuntimeError('Select an explicit GPU index and name')
     weights = (Path(package.inspect_weights(weights_root, allow_derived_layouts=allow_derived_layouts).get('weights_dir', weights_root))
                if dry_run else package.find_weights(weights_root, allow_derived_layouts=allow_derived_layouts))
     hip_files = ensure_hip_artifacts() if not dry_run else hip_paths()
@@ -393,7 +466,7 @@ def install_hip(exe, weights_root, *, magpie=False, replace_existing=False,
         collisions = []
         targets = [package.ADDON, loader_name, 'dlss5_hip.dll']
         if live_pair:
-            targets += ['lmxxf-d3d12.dll', 'd3d12core.dll', 'ReShade.ini']
+            targets += ['dlss5-d3d12.dll', 'd3d12core.dll', 'ReShade.ini']
         for relative in targets:
             if (exe.parent / relative).exists():
                 collisions.append(relative)
@@ -412,24 +485,39 @@ def install_hip(exe, weights_root, *, magpie=False, replace_existing=False,
             if not ini.has_section('PROXY'):
                 ini.add_section('PROXY')
             ini.set('PROXY', 'EnableProxyLibrary', '1')
-            ini.set('PROXY', 'ProxyLibrary', '.\\lmxxf-d3d12.dll')
+            ini.set('PROXY', 'ProxyLibrary', '.\\dlss5-d3d12.dll')
             text = io.StringIO()
             ini.write(text, space_around_delimiters=False)
             proxy_ini = text.getvalue().encode()
+        library = Path(hip_library).expanduser().absolute() if hip_library else None
+        so_digest = package.sha256(hip_files['so']) if hip_files['so'].is_file() else None
+        library_digest = package.sha256(library) if library is not None and library.is_file() else None
         wrapper = wrapper_bytes(exe, magpie=magpie, gpu_name=gpu_name, hip=True,
-                                hip_so=store / 'lib' / 'libdlss5_hip.so')
+                                hip_so=store / 'lib' / 'libdlss5_hip.so', gpu=gpu,
+                                so_digest=so_digest, hip_library=library,
+                                hip_library_digest=library_digest)
         result = dict({'installed': False, 'valid': False, 'dry_run': dry_run, 'notes': list(HIP_NOTES),
                        'mode': 'magpie' if magpie else 'game', 'hip': True,
-                       'weights': str(weights)}, **prefix_paths(exe))
+                       'weights': str(weights), 'gpu': gpu,
+                       'hip_library': str(library) if library else None}, **prefix_paths(exe))
         if dry_run:
             result['collisions'] = collisions
             return result
-        data = _begin_install(exe, hip=True, mode='magpie' if magpie else 'game', weights=str(weights))
+        data = _begin_install(exe, hip=True, mode='magpie' if magpie else 'game', weights=str(weights),
+                              gpu=gpu, hip_library=str(library) if library else None,
+                              hip_library_sha256=library_digest)
         for name in ('backups', 'logs', 'lib'):
             (store / name).mkdir(mode=0o700, exist_ok=True)
         files = data['files']
         dest_assets = exe.parent / 'DLSS5-AMD' / 'native-game-tiled-assets'
         dest_assets.mkdir(parents=True, exist_ok=True)
+        keep = {entry.name for entry in weights.iterdir()
+                if entry.is_file() and not entry.is_symlink()
+                and (entry.suffix.lower() in {'.f32', '.f16', '.i32', '.hlsl', '.hlsli', '.cso'}
+                     or entry.name in {'manifest.json', 'full-network.ok'})}
+        pruned = _prune_weights(exe, files, store, data, keep, remove_unmanaged=replace_existing)
+        if pruned:
+            result['pruned_weights'] = pruned
         for entry in sorted(weights.iterdir()):
             if entry.is_symlink() or not entry.is_file():
                 continue
@@ -442,7 +530,7 @@ def install_hip(exe, weights_root, *, magpie=False, replace_existing=False,
         _overlay(exe, loader_name, hip_files['reshade'], files, store)
         _overlay(exe, 'dlss5_hip.dll', hip_files['dll'], files, store)
         if live_pair:
-            _overlay(exe, 'lmxxf-d3d12.dll', hip_files['vkd3d'], files, store)
+            _overlay(exe, 'dlss5-d3d12.dll', hip_files['vkd3d'], files, store)
             _overlay(exe, 'd3d12core.dll', hip_files['vkd3dcore'], files, store)
             _overlay_bytes(exe, 'ReShade.ini', proxy_ini, files, store)
         _overlay(exe, STORE + '/lib/libdlss5_hip.so', hip_files['so'], files, store)
@@ -511,7 +599,7 @@ def install_package(exe, package_root, *, magpie=False, replace_existing=False,
 
 def uninstall_game(exe, *, yes=False):
     if not yes:
-        raise RuntimeError('Pass --yes to restore backups and remove the lmxxf files')
+        raise RuntimeError('Pass --yes to restore backups and remove the dlss5 files')
     exe = _exe(exe)
     with _lock(exe.parent):
         if running_game(exe):
@@ -533,7 +621,9 @@ def uninstall_game(exe, *, yes=False):
                 allowed = {item['sha256']}
                 if data.get('state') in {'installing', 'uninstalling'}:
                     allowed.update((original, item.get('previous_sha256')))
-                if _digest(target) not in allowed:
+                # ReShade re-saves its settings at runtime; the file is
+                # regenerated on install and deleted/restored on uninstall.
+                if relative not in RUNTIME_MUTABLE and _digest(target) not in allowed:
                     raise RuntimeError(f'Refusing to remove a changed deployed file: {relative}')
         data['state'] = 'uninstalling'
         _journal(store, data)

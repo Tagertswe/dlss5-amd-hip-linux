@@ -1,4 +1,4 @@
-// Native HIP implementation of the published lmxxf image codecs.
+// Native HIP implementation of the published dlss5 image codecs.
 #include "dlss5_frame.hpp"
 #include "dlss5_runtime.hpp"
 #include <cmath>

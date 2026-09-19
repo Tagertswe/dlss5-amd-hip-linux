@@ -46,7 +46,8 @@ class ReleaseArchiveTests(unittest.TestCase):
             for name in ('installer.py', 'install.sh', 'THIRD-PARTY.md',
                          'dlssnr/__init__.py', 'dlssnr/cli.py', 'dlssnr/deploy.py',
                          'dlssnr/games.py', 'dlssnr/package.py', 'dlssnr/addon.py',
-                         'dlssnr/convert_dll.py'):
+                         'dlssnr/convert_dll.py', 'dlssnr/runtime.py', 'dlssnr/assets.py',
+                         'dlssnr/kernels.py'):
                 files['linux/' + name] = '# synthetic package source fixture\n'
             for name, content in files.items():
                 path = root / name
@@ -61,7 +62,7 @@ class ReleaseArchiveTests(unittest.TestCase):
                 members = {m.name.removeprefix(prefix): m for m in tar.getmembers()}
                 for name in ('infer_image.py', 'requirements.txt', 'HIP.md', 'bin/hip-network70',
                              'include/dlss5_capi.h', 'manifest.json', 'licenses/MinHook-LICENSE.txt',
-                             'bin/lmxxf-d3d12.dll', 'bin/d3d12core.dll', 'licenses/vkd3d-LICENSE'):
+                             'bin/dlss5-d3d12.dll', 'bin/d3d12core.dll', 'licenses/vkd3d-LICENSE'):
                     self.assertIn(name, members)
                 stream = tar.extractfile(members['manifest.json'])
                 assert stream is not None
