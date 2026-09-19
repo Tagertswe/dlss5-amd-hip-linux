@@ -4,6 +4,7 @@
 #include <d3d12.h>
 #include <dxgi1_4.h>
 #include <atomic>
+#include <cstdio>
 #include <memory>
 #include <mutex>
 #include <thread>
@@ -48,19 +49,25 @@ class NativeHipLive {
         bool display_srgb{};
         // V3 GPU-resident frame buffers, shared by all jobs: the D3D queue and the
         // serialized HIP callbacks order every in/out use in frame order, so one
-        // pair is race-free. in_buf is a READBACK buffer (GPU writes, CPU reads),
-        // out_buf an UPLOAD buffer (CPU writes, GPU reads); both stay mapped for
-        // the state lifetime and the host pointers travel to the .so, which stages
-        // H2D/D2H around the fully GPU pipeline (vkd3d's CreateSharedHandle is not
-        // implemented outside Win32, so shared-handle import is unavailable here).
+        // pair is race-free. Two backing modes, picked once per geometry:
+        //  - shared_mode: DEFAULT-heap D3D12_HEAP_FLAG_SHARED buffers + Win32 shared
+        //    handles (vkd3d exports OPAQUE_WIN32 -> dmabuf; the .so imports the
+        //    handle into HIP: fully GPU-resident, zero staging copies);
+        //  - mapped fallback: in_buf READBACK (GPU writes, CPU reads), out_buf
+        //    UPLOAD (CPU writes, GPU read), mapped for the state lifetime; the host
+        //    pointers travel to the .so, which stages H2D/D2H around the GPU pipeline.
         Ref<ID3D12Resource> in_buf,out_buf;
+        HANDLE in_handle{},out_handle{};
         void* in_host{},* out_host{};
+        bool shared_mode{};
         unsigned buf_w{},buf_h{},buf_dxgi{};
         size_t buf_bytes{};
         uint32_t buf_gen{0};
         ~State(){
             if(in_buf.p&&in_host){in_buf.p->Unmap(0,nullptr);in_host=nullptr;}
             if(out_buf.p&&out_host){out_buf.p->Unmap(0,nullptr);out_host=nullptr;}
+            if(in_handle)CloseHandle(in_handle);
+            if(out_handle)CloseHandle(out_handle);
         }
     };
     std::shared_ptr<State> state_=std::make_shared<State>();
@@ -90,15 +97,22 @@ class NativeHipLive {
         const unsigned width,height;
         const unsigned dxgi;
         DeviceResources resources;
-        // Own references to this job's mapped buffer pair, captured at Record so
-        // an in-flight job cannot observe a recreation (geometry change) racing
-        // the callback.
+        // Own references to this job's buffer pair, captured at Record so an
+        // in-flight job cannot observe a recreation (geometry change) racing the
+        // callback. The buffer refs keep the resources (and any shared-handle
+        // import built on them) alive until the job completes.
         Ref<ID3D12Resource> in_res,out_res;
+        HANDLE in_handle{},out_handle{};
         void* in_host{},* out_host{};
+        bool shared_mode{};
         uint32_t buf_gen{0};
-        void BindBuffers(ID3D12Resource* inb,ID3D12Resource* outb,void* inh,void* outh,uint32_t gen){
-            in_res.p=inb;inb->AddRef();out_res.p=outb;outb->AddRef();
-            in_host=inh;out_host=outh;buf_gen=gen;
+        void BindBuffers(const State& s){
+            in_res.p=s.in_buf.p;s.in_buf.p->AddRef();
+            out_res.p=s.out_buf.p;s.out_buf.p->AddRef();
+            shared_mode=s.shared_mode;
+            in_handle=s.in_handle;out_handle=s.out_handle;
+            in_host=s.in_host;out_host=s.out_host;
+            buf_gen=s.buf_gen;
         }
         Job(std::shared_ptr<State> s,uint64_t f,uint64_t g,NativePixelFormat p,unsigned w,unsigned h,unsigned d):
             owner(std::move(s)),frame(f),generation(g),format(p),width(w),height(h),dxgi(d){}
@@ -119,8 +133,9 @@ class NativeHipLive {
         // V3 GPU-resident callback: no CPU processing. The prefix already copied
         // color->in_buf and in_buf->out_buf (out_buf is the original-frame
         // fallback), so on ANY rejection/failure the suffix writes back the
-        // original pixels exactly like the old CPU fallback path. The .so stages
-        // the mapped in/out buffers H2D/D2H around the GPU pipeline (HOST_PTRS).
+        // original pixels exactly like the old CPU fallback path. In shared mode
+        // the .so imports the shared handles into HIP (zero staging copies); in
+        // mapped mode it stages the mapped in/out buffers H2D/D2H (HOST_PTRS).
         int Process(uint64_t queue){
             if(called.exchange(true)){Log("duplicate_callback",frame,"resubmitted command list rejected");return -1;}
             uint64_t expected=0;
@@ -136,8 +151,9 @@ class NativeHipLive {
             auto bypass=[&]{return (generation&1)||owner->disabled.load()||owner->generation.load()!=generation;};
             if(bypass()){Log("processed",frame,"F6 bypass; original input");return 0;}
             try {
-                if(owner->client->RunFrameRaw(in_host,out_host,width,height,dxgi,
-                                              unsigned(frame),owner->display_srgb,true,buf_gen)){
+                const bool use_host=!shared_mode;
+                if(owner->client->RunFrameRaw(use_host?in_host:in_handle,use_host?out_host:out_handle,
+                                              width,height,dxgi,unsigned(frame),owner->display_srgb,use_host,buf_gen)){
                     // out_buf still holds the prefix in->out copy (original pixels).
                     Log("processed",frame,"HIP failed; original input");return 0;
                 }
@@ -179,14 +195,72 @@ class NativeHipLive {
     static void ReleaseBuffers(State& s){
         if(s.in_buf.p&&s.in_host){s.in_buf.p->Unmap(0,nullptr);s.in_host=nullptr;}
         if(s.out_buf.p&&s.out_host){s.out_buf.p->Unmap(0,nullptr);s.out_host=nullptr;}
-        s.in_buf.Reset();s.out_buf.Reset();
+        if(s.in_handle){CloseHandle(s.in_handle);s.in_handle=nullptr;}
+        if(s.out_handle){CloseHandle(s.out_handle);s.out_handle=nullptr;}
+        s.in_buf.Reset();s.out_buf.Reset();s.shared_mode=false;
     }
-    // V3: one READBACK-in / UPLOAD-out buffer pair per (device, geometry, format),
-    // mapped for the state lifetime; the host pointers go to the .so (HOST_PTRS
-    // mode). Recreated on any change.
-    static bool EnsureBuffers(State& s,ID3D12Device* d,const D3D12_RESOURCE_DESC& desc,size_t bpp){
+    // Per-step failure detail; callers are serialized by the recording mutex.
+    static const char* BufferFail(const char* what,HRESULT hr=0){
+        static char detail[96];
+        if(hr)std::snprintf(detail,sizeof detail,"%s hr=0x%08lX",what,(unsigned long)hr);
+        else std::snprintf(detail,sizeof detail,"%s",what);
+        return detail;
+    }
+    static D3D12_RESOURCE_DESC BufferDesc(const D3D12_RESOURCE_DESC& desc,size_t bpp){
+        D3D12_RESOURCE_DESC buffer{};buffer.Dimension=D3D12_RESOURCE_DIMENSION_BUFFER;
+        buffer.Width=UINT64(size_t(unsigned(desc.Width))*desc.Height*bpp);
+        buffer.Height=1;buffer.DepthOrArraySize=buffer.MipLevels=1;
+        buffer.SampleDesc.Count=1;buffer.Layout=D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+        return buffer;
+    }
+    // Zero-copy mode: DEFAULT-heap buffers created with D3D12_HEAP_FLAG_SHARED.
+    // vkd3d then exports the allocation as OPAQUE_WIN32 (dma-buf under Wine) and
+    // CreateSharedHandle returns a real NT handle the .so imports into HIP.
+    static const char* TrySharedBuffers(State& s,ID3D12Device* d,const D3D12_RESOURCE_DESC& desc,size_t bpp){
+        const D3D12_RESOURCE_DESC buffer=BufferDesc(desc,bpp);
+        D3D12_HEAP_PROPERTIES heap{};heap.CreationNodeMask=heap.VisibleNodeMask=1;
+        heap.Type=D3D12_HEAP_TYPE_DEFAULT;
+        HRESULT hr=d->CreateCommittedResource(&heap,D3D12_HEAP_FLAG_SHARED,&buffer,
+            D3D12_RESOURCE_STATE_COPY_DEST,nullptr,IID_PPV_ARGS(s.in_buf.Out()));
+        if(FAILED(hr))return BufferFail("shared_in_create",hr);
+        hr=d->CreateCommittedResource(&heap,D3D12_HEAP_FLAG_SHARED,&buffer,
+            D3D12_RESOURCE_STATE_COPY_DEST,nullptr,IID_PPV_ARGS(s.out_buf.Out()));
+        if(FAILED(hr)){ReleaseBuffers(s);return BufferFail("shared_out_create",hr);}
+        const DWORD access=GENERIC_READ|GENERIC_WRITE;
+        hr=d->CreateSharedHandle(s.in_buf.p,nullptr,access,nullptr,&s.in_handle);
+        if(FAILED(hr)){ReleaseBuffers(s);return BufferFail("shared_in_handle",hr);}
+        hr=d->CreateSharedHandle(s.out_buf.p,nullptr,access,nullptr,&s.out_handle);
+        if(FAILED(hr)){ReleaseBuffers(s);return BufferFail("shared_out_handle",hr);}
+        s.shared_mode=true;
+        return nullptr;
+    }
+    // Fallback mode: CPU-mapped READBACK-in / UPLOAD-out buffers; the host
+    // pointers go to the .so (HOST_PTRS mode, H2D/D2H staging). Initial states
+    // and mapping ranges match the proven production configuration.
+    static const char* TryMappedBuffers(State& s,ID3D12Device* d,const D3D12_RESOURCE_DESC& desc,size_t bpp){
+        const D3D12_RESOURCE_DESC buffer=BufferDesc(desc,bpp);
+        D3D12_HEAP_PROPERTIES heap{};heap.CreationNodeMask=heap.VisibleNodeMask=1;
+        heap.Type=D3D12_HEAP_TYPE_READBACK;
+        HRESULT hr=d->CreateCommittedResource(&heap,D3D12_HEAP_FLAG_NONE,&buffer,
+            D3D12_RESOURCE_STATE_COPY_DEST,nullptr,IID_PPV_ARGS(s.in_buf.Out()));
+        if(FAILED(hr))return BufferFail("readback_create",hr);
+        heap.Type=D3D12_HEAP_TYPE_UPLOAD;
+        hr=d->CreateCommittedResource(&heap,D3D12_HEAP_FLAG_NONE,&buffer,
+            D3D12_RESOURCE_STATE_GENERIC_READ,nullptr,IID_PPV_ARGS(s.out_buf.Out()));
+        if(FAILED(hr)){ReleaseBuffers(s);return BufferFail("upload_create",hr);}
+        const D3D12_RANGE full{0,(SIZE_T)(size_t(unsigned(desc.Width))*desc.Height*bpp)},none{};
+        hr=s.in_buf.p->Map(0,&full,&s.in_host);
+        if(FAILED(hr)){ReleaseBuffers(s);return BufferFail("in_map",hr);}
+        hr=s.out_buf.p->Map(0,&none,&s.out_host);
+        if(FAILED(hr)){ReleaseBuffers(s);return BufferFail("out_map",hr);}
+        return nullptr;
+    }
+    // V3: one in/out buffer pair per (device, geometry, format), recreated on any
+    // change. Prefers the zero-copy shared-handle mode; falls back to mapped
+    // buffers. Returns nullptr on success, a reason string else.
+    static const char* EnsureBuffers(State& s,ID3D12Device* d,const D3D12_RESOURCE_DESC& desc,size_t bpp){
         const unsigned w=unsigned(desc.Width),h=desc.Height,dxgi=unsigned(desc.Format);
-        if(s.in_buf.p&&s.buf_w==w&&s.buf_h==h&&s.buf_dxgi==dxgi)return true;
+        if(s.in_buf.p&&s.buf_w==w&&s.buf_h==h&&s.buf_dxgi==dxgi)return nullptr;
         // BufLoc assumes a packed footprint (RowPitch == width*bpp). Reject any
         // row-padded layout before we allocate. Same check as the old Create().
         {
@@ -196,29 +270,14 @@ class NativeHipLive {
             if(rows!=h||rowbytes!=packed||fp.Footprint.Width!=desc.Width||
                fp.Footprint.Height!=h||fp.Footprint.Depth!=1||fp.Footprint.Format!=desc.Format||
                fp.Footprint.RowPitch<packed||!total||
-               UINT64(h-1)*fp.Footprint.RowPitch+packed>total-fp.Offset)return false;
+               UINT64(h-1)*fp.Footprint.RowPitch+packed>total-fp.Offset)return BufferFail("packed_footprint_check");
         }
         ReleaseBuffers(s);
-        D3D12_RESOURCE_DESC buffer{};buffer.Dimension=D3D12_RESOURCE_DIMENSION_BUFFER;
-        buffer.Width=UINT64(size_t(w)*h*bpp);buffer.Height=1;buffer.DepthOrArraySize=buffer.MipLevels=1;
-        buffer.SampleDesc.Count=1;buffer.Layout=D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
-        D3D12_HEAP_PROPERTIES heap{};heap.CreationNodeMask=heap.VisibleNodeMask=1;
-        // in_buf: the prefix copies color into it (GPU write) and the .so reads the
-        // mapped pointer (CPU read) -> READBACK. out_buf: the .so writes the mapped
-        // pointer (CPU write) and the suffix copies it into color (GPU read) -> UPLOAD.
-        heap.Type=D3D12_HEAP_TYPE_READBACK;
-        if(FAILED(d->CreateCommittedResource(&heap,D3D12_HEAP_FLAG_NONE,&buffer,
-            D3D12_RESOURCE_STATE_COPY_DEST,nullptr,IID_PPV_ARGS(s.in_buf.Out()))))return false;
-        heap.Type=D3D12_HEAP_TYPE_UPLOAD;
-        if(FAILED(d->CreateCommittedResource(&heap,D3D12_HEAP_FLAG_NONE,&buffer,
-            D3D12_RESOURCE_STATE_COPY_DEST,nullptr,IID_PPV_ARGS(s.out_buf.Out())))){ReleaseBuffers(s);return false;}
-        D3D12_RANGE zero{};
-        if(FAILED(s.in_buf.p->Map(0,&zero,&s.in_host))||
-           FAILED(s.out_buf.p->Map(0,&zero,&s.out_host))){
-            ReleaseBuffers(s);return false;
-        }
+        const char* err=TrySharedBuffers(s,d,desc,bpp);
+        if(err)err=TryMappedBuffers(s,d,desc,bpp);
+        if(err)return err;
         s.buf_w=w;s.buf_h=h;s.buf_dxgi=dxgi;s.buf_bytes=size_t(w)*h*bpp;s.buf_gen++;
-        return true;
+        return nullptr;
     }
     // Prefix: color -> in_buf, then in_buf -> out_buf. The second copy keeps
     // out_buf an exact original-frame fallback until the .so overwrites its RGB.
@@ -330,8 +389,12 @@ public:
             struct Caller {Job* p;~Caller(){p->Release();}} caller{raw};
             raw->resources.Bind(device.p,color);
             const size_t bpp=NativePixelBytes(format);
-            if(!EnsureBuffers(*s,device.p,desc,bpp)){Log("setup_failed",frame_id,"buffer create/map failed; original unchanged");return false;}
-            raw->BindBuffers(s->in_buf.p,s->out_buf.p,s->in_host,s->out_host,s->buf_gen);
+            const bool fresh_buffers=!s->in_buf.p;
+            const char* buf_err=EnsureBuffers(*s,device.p,desc,bpp);
+            if(buf_err){Log("setup_failed",frame_id,buf_err);return false;}
+            if(fresh_buffers)
+                Log("buffers",frame_id,s->shared_mode?"shared handles; zero-copy GPU path":"mapped READBACK/UPLOAD; H2D staging fallback");
+            raw->BindBuffers(*s);
             if(FAILED(list->SetPrivateDataInterface(raw->anchor,raw))){Log("anchor_failed",frame_id);return false;}
             CopyPrefix(list,*s,state,color,desc,bpp);
             uint32_t accepted=0;
