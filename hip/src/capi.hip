@@ -50,6 +50,9 @@ static Dlss5HipDeviceBridge g_device_bridge;
 static int g_gpu;
 struct FrameBuffers {
     dlss5::DeviceBuf source,proxy,neural,decoded,history,motion,warped,base;
+    // HOST_PTRS raw mode: device staging for CPU-mapped D3D12 in/out buffers.
+    dlss5::DeviceBuf raw_in,raw_out;
+    size_t raw_in_size=0;
     std::vector<float> host_proxy,host_neural,host_warped,host_result;
     bool history_valid=false;
     dlss5_u32 previous_flags=0;
@@ -293,8 +296,9 @@ extern "C" int dlss5_run_frame_gpu(const float* dev_in, float* dev_out, uint32_t
 extern "C" int dlss5_run_frame_raw_gpu(const Dlss5FrameRaw* f) {
     std::lock_guard<std::mutex> lock(g_mu);
     if (!g_net) return set_err("not initialized"), -1;
-    if (!f || f->struct_size != sizeof(Dlss5FrameRaw) || (f->flags & ~0x3u) ||
-        !(f->flags & DLSS5_HIP_RAW_FLAGS_DEV_PTRS) && (!f->in_handle || !f->out_handle) ||
+    if (!f || f->struct_size != sizeof(Dlss5FrameRaw) || (f->flags & ~0x7u) ||
+        (f->flags & DLSS5_HIP_RAW_FLAGS_DEV_PTRS) && (f->flags & DLSS5_HIP_RAW_FLAGS_HOST_PTRS) ||
+        !f->in_handle || !f->out_handle ||
         f->width < 1 || f->height < 1 || f->width > 7680 || f->height > 4320 ||
         dlss5::gpu::format_from_dxgi(f->dxgi_format) == dlss5::gpu::FmtUnsupported)
         return set_err("invalid raw frame ABI/buffers"), -1;
@@ -305,9 +309,17 @@ extern "C" int dlss5_run_frame_raw_gpu(const Dlss5FrameRaw* f) {
         if (!g_frame) {auto next=std::make_unique<FrameBuffers>();next->create();g_frame=std::move(next);}
         auto& b=*g_frame;
         const bool dev_ptrs=(f->flags & DLSS5_HIP_RAW_FLAGS_DEV_PTRS)!=0;
+        const bool host_ptrs=(f->flags & DLSS5_HIP_RAW_FLAGS_HOST_PTRS)!=0;
         const size_t bytes=size_t(f->width)*f->height*((f->dxgi_format==28||f->dxgi_format==87)?4u:8u);
         void* dev_in=nullptr,* dev_out=nullptr;
         if (dev_ptrs) {dev_in=f->in_handle;dev_out=f->out_handle;}
+        else if (host_ptrs) {
+            // CPU-mapped D3D12 READBACK/UPLOAD buffers: stage packed pixels on the GPU.
+            if (b.raw_in_size!=bytes) {b.raw_in.alloc(bytes);b.raw_out.alloc(bytes);b.raw_in_size=bytes;}
+            dev_in=b.raw_in.p;dev_out=b.raw_out.p;
+            dlss5::hip_check(hipMemcpy(dev_in,f->in_handle,bytes,hipMemcpyHostToDevice),"raw input h2d");
+            ft.mark("stage_in");
+        }
         else {
             if (!dlss5::gpu::map_device(f->in_handle,bytes,f->handle_gen,&dev_in)) throw std::runtime_error("cannot import input handle");
             if (!dlss5::gpu::map_device(f->out_handle,bytes,f->handle_gen,&dev_out)) throw std::runtime_error("cannot import output handle");
@@ -315,8 +327,11 @@ extern "C" int dlss5_run_frame_raw_gpu(const Dlss5FrameRaw* f) {
         const auto fmt=dlss5::gpu::format_from_dxgi(f->dxgi_format);
         auto bypass=[&]() {
             // CPU bypass semantics: keep the original pixels, alpha exact.
-            dlss5::hip_check(hipMemcpy(dev_out,dev_in,bytes,hipMemcpyDeviceToDevice),"bypass copy");
-            dlss5::hip_check(hipStreamSynchronize(nullptr),"bypass sync");
+            if (host_ptrs) {std::memcpy(f->out_handle,f->in_handle,bytes);}
+            else {
+                dlss5::hip_check(hipMemcpy(dev_out,dev_in,bytes,hipMemcpyDeviceToDevice),"bypass copy");
+                dlss5::hip_check(hipStreamSynchronize(nullptr),"bypass sync");
+            }
             g_err.clear();return 0;
         };
         b.history_valid=false;b.previous_flags=f->flags&1u;b.previous_white=f->paper_white;
@@ -338,6 +353,7 @@ extern "C" int dlss5_run_frame_raw_gpu(const Dlss5FrameRaw* f) {
         dlss5::gpu::launch_rgb_to_pix(b.decoded.as<float>(),(const uint8_t*)dev_in,(uint8_t*)dev_out,f->width,f->height,f->dxgi_format);
         ft.mark("conv_out");
         dlss5::hip_check(hipStreamSynchronize(nullptr),"raw frame out");
+        if (host_ptrs) dlss5::hip_check(hipMemcpy(f->out_handle,dev_out,bytes,hipMemcpyDeviceToHost),"raw output d2h");
         ft.mark("sync_out");
         g_err.clear();return 0;
     } catch(const std::exception&e) {set_err(e.what());return -1;}

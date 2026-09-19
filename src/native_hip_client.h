@@ -102,21 +102,24 @@ public:
    // callers use run_frame with explicit XY buffers; this path resets history.
    int rc=p_frame(&f);if(rc&&p_err)Log("hip_run_failed",p_err());return rc;
   }
-  // V3 GPU-resident path: packed pixels stay on the GPU in DEFAULT-heap buffers.
-  // in/out handles are Win32 D3D12 shared handles (imported into HIP by the .so).
-  // Semantics match RunFrame: RGB replaced, alpha exact; on reject out keeps a
-  // copy of in (the caller guarantees that via a prefix in->out GPU copy).
-  bool HasRawGpu()const{std::lock_guard<std::mutex> lock(Mutex());return ready_&&p_frame_raw!=nullptr;}
-  int RunFrameRaw(void*in_handle,void*out_handle,unsigned width,unsigned height,unsigned dxgi_format,
-                  unsigned seed,bool display_srgb,unsigned handle_gen){
-   std::lock_guard<std::mutex> lock(Mutex());
-   if(!ready_||!p_frame_raw)return -1;
-   Dlss5FrameRaw f{};f.struct_size=sizeof f;
-   f.in_handle=in_handle;f.out_handle=out_handle;f.width=width;f.height=height;
-   f.dxgi_format=dxgi_format;f.seed=seed;f.flags=display_srgb?DLSS5_HIP_RAW_FLAGS_SRGB:0;
-   f.paper_white=f.transfer=f.color=1;f.handle_gen=handle_gen;
-   int rc=p_frame_raw(&f);if(rc&&p_err)Log("hip_raw_frame_failed",p_err());return rc;
-  }
+   // V3 GPU-resident path: packed pixels stay on the GPU. in/out are either Win32
+   // D3D12 shared handles (host_ptrs=false, imported into HIP by the .so) or host
+   // pointers to CPU-mapped READBACK/UPLOAD D3D12 buffers (host_ptrs=true; the .so
+   // stages H2D/D2H around the GPU pipeline). Semantics match RunFrame: RGB
+   // replaced, alpha exact; on reject out keeps a copy of in (the caller
+   // guarantees that via a prefix in->out GPU copy).
+   bool HasRawGpu()const{std::lock_guard<std::mutex> lock(Mutex());return ready_&&p_frame_raw!=nullptr;}
+   int RunFrameRaw(void*in_handle,void*out_handle,unsigned width,unsigned height,unsigned dxgi_format,
+                   unsigned seed,bool display_srgb,bool host_ptrs,unsigned handle_gen){
+    std::lock_guard<std::mutex> lock(Mutex());
+    if(!ready_||!p_frame_raw)return -1;
+    Dlss5FrameRaw f{};f.struct_size=sizeof f;
+    f.in_handle=in_handle;f.out_handle=out_handle;f.width=width;f.height=height;
+    f.dxgi_format=dxgi_format;f.seed=seed;
+    f.flags=(display_srgb?DLSS5_HIP_RAW_FLAGS_SRGB:0u)|(host_ptrs?DLSS5_HIP_RAW_FLAGS_HOST_PTRS:0u);
+    f.paper_white=f.transfer=f.color=1;f.handle_gen=handle_gen;
+    int rc=p_frame_raw(&f);if(rc&&p_err)Log("hip_raw_frame_failed",p_err());return rc;
+   }
   ~NativeHipClient(){std::lock_guard<std::mutex> lock(Mutex());Release();}
 };
 

@@ -48,16 +48,19 @@ class NativeHipLive {
         bool display_srgb{};
         // V3 GPU-resident frame buffers, shared by all jobs: the D3D queue and the
         // serialized HIP callbacks order every in/out use in frame order, so one
-        // pair is race-free. Handles are created once and kept open for the state
-        // lifetime; buf_gen disambiguates the HIP import cache across recreation.
+        // pair is race-free. in_buf is a READBACK buffer (GPU writes, CPU reads),
+        // out_buf an UPLOAD buffer (CPU writes, GPU reads); both stay mapped for
+        // the state lifetime and the host pointers travel to the .so, which stages
+        // H2D/D2H around the fully GPU pipeline (vkd3d's CreateSharedHandle is not
+        // implemented outside Win32, so shared-handle import is unavailable here).
         Ref<ID3D12Resource> in_buf,out_buf;
-        HANDLE in_handle{},out_handle{};
+        void* in_host{},* out_host{};
         unsigned buf_w{},buf_h{},buf_dxgi{};
         size_t buf_bytes{};
         uint32_t buf_gen{0};
         ~State(){
-            if(in_handle)CloseHandle(in_handle);
-            if(out_handle)CloseHandle(out_handle);
+            if(in_buf.p&&in_host){in_buf.p->Unmap(0,nullptr);in_host=nullptr;}
+            if(out_buf.p&&out_host){out_buf.p->Unmap(0,nullptr);out_host=nullptr;}
         }
     };
     std::shared_ptr<State> state_=std::make_shared<State>();
@@ -87,6 +90,16 @@ class NativeHipLive {
         const unsigned width,height;
         const unsigned dxgi;
         DeviceResources resources;
+        // Own references to this job's mapped buffer pair, captured at Record so
+        // an in-flight job cannot observe a recreation (geometry change) racing
+        // the callback.
+        Ref<ID3D12Resource> in_res,out_res;
+        void* in_host{},* out_host{};
+        uint32_t buf_gen{0};
+        void BindBuffers(ID3D12Resource* inb,ID3D12Resource* outb,void* inh,void* outh,uint32_t gen){
+            in_res.p=inb;inb->AddRef();out_res.p=outb;outb->AddRef();
+            in_host=inh;out_host=outh;buf_gen=gen;
+        }
         Job(std::shared_ptr<State> s,uint64_t f,uint64_t g,NativePixelFormat p,unsigned w,unsigned h,unsigned d):
             owner(std::move(s)),frame(f),generation(g),format(p),width(w),height(h),dxgi(d){}
         ~Job(){owner->inflight.fetch_sub(1);}
@@ -103,10 +116,11 @@ class NativeHipLive {
             auto& j=*static_cast<Job*>(p);
             try{return j.Process(queue);}catch(...){Log("callback_failure",j.frame,"device must be lost; suffix not safe");return -1;}
         }
-        // V3 GPU-resident callback: no CPU readback. The prefix already copied
+        // V3 GPU-resident callback: no CPU processing. The prefix already copied
         // color->in_buf and in_buf->out_buf (out_buf is the original-frame
         // fallback), so on ANY rejection/failure the suffix writes back the
-        // original pixels exactly like the old CPU fallback path.
+        // original pixels exactly like the old CPU fallback path. The .so stages
+        // the mapped in/out buffers H2D/D2H around the GPU pipeline (HOST_PTRS).
         int Process(uint64_t queue){
             if(called.exchange(true)){Log("duplicate_callback",frame,"resubmitted command list rejected");return -1;}
             uint64_t expected=0;
@@ -122,8 +136,8 @@ class NativeHipLive {
             auto bypass=[&]{return (generation&1)||owner->disabled.load()||owner->generation.load()!=generation;};
             if(bypass()){Log("processed",frame,"F6 bypass; original input");return 0;}
             try {
-                if(owner->client->RunFrameRaw(owner->in_handle,owner->out_handle,width,height,dxgi,
-                                             unsigned(frame),owner->display_srgb,owner->buf_gen)){
+                if(owner->client->RunFrameRaw(in_host,out_host,width,height,dxgi,
+                                              unsigned(frame),owner->display_srgb,true,buf_gen)){
                     // out_buf still holds the prefix in->out copy (original pixels).
                     Log("processed",frame,"HIP failed; original input");return 0;
                 }
@@ -162,8 +176,14 @@ class NativeHipLive {
     // Implicit-barrier state (Windows 11 SDK); missing from mingw-w64 headers
     // and outside the enum's constant range, so it travels as a plain int.
     static constexpr int StateUnknown=0x80000000;
-    // V3: one DEFAULT-heap in/out buffer pair per (device, geometry, format), with
-    // Win32 shared handles the .so imports into HIP. Recreated on any change.
+    static void ReleaseBuffers(State& s){
+        if(s.in_buf.p&&s.in_host){s.in_buf.p->Unmap(0,nullptr);s.in_host=nullptr;}
+        if(s.out_buf.p&&s.out_host){s.out_buf.p->Unmap(0,nullptr);s.out_host=nullptr;}
+        s.in_buf.Reset();s.out_buf.Reset();
+    }
+    // V3: one READBACK-in / UPLOAD-out buffer pair per (device, geometry, format),
+    // mapped for the state lifetime; the host pointers go to the .so (HOST_PTRS
+    // mode). Recreated on any change.
     static bool EnsureBuffers(State& s,ID3D12Device* d,const D3D12_RESOURCE_DESC& desc,size_t bpp){
         const unsigned w=unsigned(desc.Width),h=desc.Height,dxgi=unsigned(desc.Format);
         if(s.in_buf.p&&s.buf_w==w&&s.buf_h==h&&s.buf_dxgi==dxgi)return true;
@@ -178,25 +198,24 @@ class NativeHipLive {
                fp.Footprint.RowPitch<packed||!total||
                UINT64(h-1)*fp.Footprint.RowPitch+packed>total-fp.Offset)return false;
         }
-        if(s.in_handle){CloseHandle(s.in_handle);s.in_handle=nullptr;}
-        if(s.out_handle){CloseHandle(s.out_handle);s.out_handle=nullptr;}
-        s.in_buf.Reset();s.out_buf.Reset();
+        ReleaseBuffers(s);
         D3D12_RESOURCE_DESC buffer{};buffer.Dimension=D3D12_RESOURCE_DIMENSION_BUFFER;
         buffer.Width=UINT64(size_t(w)*h*bpp);buffer.Height=1;buffer.DepthOrArraySize=buffer.MipLevels=1;
         buffer.SampleDesc.Count=1;buffer.Layout=D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
         D3D12_HEAP_PROPERTIES heap{};heap.CreationNodeMask=heap.VisibleNodeMask=1;
-        heap.Type=D3D12_HEAP_TYPE_DEFAULT;
+        // in_buf: the prefix copies color into it (GPU write) and the .so reads the
+        // mapped pointer (CPU read) -> READBACK. out_buf: the .so writes the mapped
+        // pointer (CPU write) and the suffix copies it into color (GPU read) -> UPLOAD.
+        heap.Type=D3D12_HEAP_TYPE_READBACK;
         if(FAILED(d->CreateCommittedResource(&heap,D3D12_HEAP_FLAG_NONE,&buffer,
-            D3D12_RESOURCE_STATE_COPY_DEST,nullptr,IID_PPV_ARGS(s.in_buf.Out())))||
-           FAILED(d->CreateCommittedResource(&heap,D3D12_HEAP_FLAG_NONE,&buffer,
-            D3D12_RESOURCE_STATE_COPY_DEST,nullptr,IID_PPV_ARGS(s.out_buf.Out()))))return false;
-        // R|W: HIP maps in_buf read-only and out_buf read-write.
-        const DWORD access=GENERIC_READ|GENERIC_WRITE;
-        if(FAILED(d->CreateSharedHandle(s.in_buf.p,nullptr,access,nullptr,&s.in_handle))||
-           FAILED(d->CreateSharedHandle(s.out_buf.p,nullptr,access,nullptr,&s.out_handle))){
-            if(s.in_handle){CloseHandle(s.in_handle);s.in_handle=nullptr;}
-            if(s.out_handle){CloseHandle(s.out_handle);s.out_handle=nullptr;}
-            s.in_buf.Reset();s.out_buf.Reset();return false;
+            D3D12_RESOURCE_STATE_COPY_DEST,nullptr,IID_PPV_ARGS(s.in_buf.Out()))))return false;
+        heap.Type=D3D12_HEAP_TYPE_UPLOAD;
+        if(FAILED(d->CreateCommittedResource(&heap,D3D12_HEAP_FLAG_NONE,&buffer,
+            D3D12_RESOURCE_STATE_COPY_DEST,nullptr,IID_PPV_ARGS(s.out_buf.Out())))){ReleaseBuffers(s);return false;}
+        D3D12_RANGE zero{};
+        if(FAILED(s.in_buf.p->Map(0,&zero,&s.in_host))||
+           FAILED(s.out_buf.p->Map(0,&zero,&s.out_host))){
+            ReleaseBuffers(s);return false;
         }
         s.buf_w=w;s.buf_h=h;s.buf_dxgi=dxgi;s.buf_bytes=size_t(w)*h*bpp;s.buf_gen++;
         return true;
@@ -311,7 +330,8 @@ public:
             struct Caller {Job* p;~Caller(){p->Release();}} caller{raw};
             raw->resources.Bind(device.p,color);
             const size_t bpp=NativePixelBytes(format);
-            if(!EnsureBuffers(*s,device.p,desc,bpp)){Log("setup_failed",frame_id,"buffer create/shared handle failed; original unchanged");return false;}
+            if(!EnsureBuffers(*s,device.p,desc,bpp)){Log("setup_failed",frame_id,"buffer create/map failed; original unchanged");return false;}
+            raw->BindBuffers(s->in_buf.p,s->out_buf.p,s->in_host,s->out_host,s->buf_gen);
             if(FAILED(list->SetPrivateDataInterface(raw->anchor,raw))){Log("anchor_failed",frame_id);return false;}
             CopyPrefix(list,*s,state,color,desc,bpp);
             uint32_t accepted=0;

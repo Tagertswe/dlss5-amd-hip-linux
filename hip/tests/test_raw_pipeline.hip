@@ -108,12 +108,28 @@ int main(int argc,char**argv){
   g.seed=7u+fr;g.flags=DLSS5_HIP_RAW_FLAGS_DEV_PTRS;
   g.paper_white=g.transfer=g.color=1.f;
   if(dlss5_run_frame_raw_gpu(&g)!=0){printf("gpu frame %d failed: %s\n",fr,dlss5_last_error());++fails;continue;}
-  gout.download(out_gpu.data(),pixbytes);
-  size_t bad=0;long long first=-1;
-  for(size_t i=0;i<pixbytes;++i)if(out_gpu[i]!=out_cpu[i]){if(first<0)first=(long long)i;++bad;}
-  if(bad){printf("frame %d: mismatches=%zu/%zu first=%lld cpu=%02x gpu=%02x\n",fr,bad,pixbytes,first,out_cpu[(size_t)first],out_gpu[(size_t)first]);++fails;}
-  else printf("frame %d: byte-exact (%zu bytes)\n",fr,pixbytes);
- }
+   gout.download(out_gpu.data(),pixbytes);
+   size_t bad=0;long long first=-1;
+   for(size_t i=0;i<pixbytes;++i)if(out_gpu[i]!=out_cpu[i]){if(first<0)first=(long long)i;++bad;}
+   if(bad){printf("frame %d: mismatches=%zu/%zu first=%lld cpu=%02x gpu=%02x\n",fr,bad,pixbytes,first,out_cpu[(size_t)first],out_gpu[(size_t)first]);++fails;}
+   else printf("frame %d: byte-exact (%zu bytes)\n",fr,pixbytes);
+   // Host-pointer mode: CPU-mapped D3D12 buffer surrogates (H2D/D2H staging).
+   // Simulates the in-game flow: prefix leaves raw pixels in in and a copy in out.
+   std::vector<unsigned char> hin(pixbytes),hout(pixbytes,0);
+   std::memcpy(hin.data(),raw.data(),pixbytes);
+   std::memcpy(hout.data(),raw.data(),pixbytes);
+   Dlss5FrameRaw hp{};
+   hp.struct_size=sizeof hp;
+   hp.in_handle=hin.data();hp.out_handle=hout.data();
+   hp.width=W;hp.height=H;hp.dxgi_format=87;
+   hp.seed=7u+fr;hp.flags=DLSS5_HIP_RAW_FLAGS_HOST_PTRS;
+   hp.paper_white=hp.transfer=hp.color=1.f;
+   if(dlss5_run_frame_raw_gpu(&hp)!=0){printf("host frame %d failed: %s\n",fr,dlss5_last_error());++fails;continue;}
+   size_t badh=0;long long firsth=-1;
+   for(size_t i=0;i<pixbytes;++i)if(hout[i]!=out_cpu[i]){if(firsth<0)firsth=(long long)i;++badh;}
+   if(badh){printf("host frame %d: mismatches=%zu/%zu first=%lld cpu=%02x host=%02x\n",fr,badh,pixbytes,firsth,out_cpu[(size_t)firsth],hout[(size_t)firsth]);++fails;}
+   else printf("host frame %d: byte-exact (%zu bytes)\n",fr,pixbytes);
+  }
  dlss5_shutdown();
  printf("raw gpu pipeline bit-exact: %s\n",fails?"FAIL":"PASS");
  return fails?1:0;
