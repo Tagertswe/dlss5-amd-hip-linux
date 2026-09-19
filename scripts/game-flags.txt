@@ -102,3 +102,5 @@ DLSS5_DECODER_TILED=1
 DLSS5_SPLIT_FFWD_TILED=1
 DLSS5_SPLIT_STREAM8=1
 DLSS5_DECODER_OUT16=1
+
+# Optional: DLSS5_FIXED_SEED=<n> pins the prefix noise seed (default: per-frame stochastic).

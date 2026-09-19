@@ -47,6 +47,9 @@ class NativeHipLive {
         std::atomic<unsigned> inflight{0};
         std::mutex recording,processing;
         bool display_srgb{};
+        // 0xFFFFFFFF = per-frame seed (stochastic); otherwise a fixed prefix
+        // noise seed so a non-temporal run produces a stable image.
+        unsigned fixed_seed{0xFFFFFFFFu};
         // V3 GPU-resident frame buffers, shared by all jobs: the D3D queue and the
         // serialized HIP callbacks order every in/out use in frame order, so one
         // pair is race-free. Two backing modes, picked once per geometry:
@@ -161,7 +164,9 @@ class NativeHipLive {
             try {
                 const bool use_host=!shared_mode;
                 if(owner->client->RunFrameRaw(use_host?in_host:in_handle,use_host?out_host:out_handle,
-                                              width,height,dxgi,unsigned(frame),owner->display_srgb,use_host,buf_gen)){
+                                              width,height,dxgi,
+                                              owner->fixed_seed!=0xFFFFFFFFu?owner->fixed_seed:unsigned(frame),
+                                              owner->display_srgb,use_host,buf_gen)){
                     // out_buf still holds the prefix in->out copy (original pixels).
                     Log("processed",frame,"HIP failed; original input");return 0;
                 }
@@ -353,7 +358,19 @@ class NativeHipLive {
             auto client=std::make_shared<NativeHipClient>();client->Create(name);
             if(!client->Ready())throw std::runtime_error("HIP client not ready");
             s->client=std::move(client);
+            if(FILE* flags=_wfopen(NativeLabPath(L"native-game-flags.txt").c_str(),L"rb")){
+                char line[256];
+                while(fgets(line,sizeof line,flags)){
+                    size_t n=strlen(line);
+                    while(n&&(line[n-1]=='\n'||line[n-1]=='\r'||line[n-1]==' '))line[--n]=0;
+                    if(n>17&&!strncmp(line,"DLSS5_FIXED_SEED=",17))s->fixed_seed=(unsigned)strtoul(line+17,nullptr,0);
+                }
+                fclose(flags);
+            }
+            char seed_text[48];
+            snprintf(seed_text,sizeof seed_text,s->fixed_seed==0xFFFFFFFFu?"per-frame stochastic":"fixed %u",s->fixed_seed);
             Log("ready",0,name);Log("codec",0,s->display_srgb?"explicit display-sRGB; DLSS5_CODEC_SRGB=1":"linear mode=1 paper_white=1");
+            Log("prefix_seed",0,seed_text);
             Log("live_network",0,"enabled; F6 toggles bypass; reset every frame, NOT temporal; no performance claim");
             s->init.store(2,std::memory_order_release);
         }catch(const std::exception& e){Log("init_failed",0,e.what());s->init=-1;s->disabled=true;}
