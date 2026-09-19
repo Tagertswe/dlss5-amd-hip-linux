@@ -8,7 +8,8 @@ from pathlib import Path
 import platform
 import sys
 
-from . import addon, assets, deploy, games, kernels, package, runtime
+from . import VERSION, TAGLINE
+from . import addon, assets, deploy, games, kernels, package, runtime, terminal
 
 PACKAGE_ROOT = Path(__file__).resolve().parents[1]
 REPO_ROOT = PACKAGE_ROOT.parent
@@ -99,6 +100,18 @@ def bundled_targets():
     return kernels.FALLBACK_TARGETS
 
 
+def _enter_game_path():
+    entered = input('Game directory or .exe path (empty to cancel): ').strip()
+    if not entered:
+        raise RuntimeError('No game selected; nothing installed.')
+    path = Path(entered).expanduser().absolute()
+    if path.is_dir():
+        return games.select_executable(path)
+    if path.suffix.lower() == '.exe':
+        return games.select_executable(path.parent, path)
+    raise RuntimeError('Enter the game directory or the game .exe (non-Steam games are supported).')
+
+
 def resolve_exe(args, interactive):
     if args.appid and (not args.appid.isascii() or not args.appid.isdecimal()):
         raise RuntimeError('--appid must be an exact numeric Steam ID.')
@@ -120,7 +133,12 @@ def resolve_exe(args, interactive):
     if not args.game_dir and not args.exe and interactive:
         entries = games.discover_games(args.steam_root)
         if entries:
-            game = choose(entries, 'Steam game', lambda g: f"{g['name']} [{g['appid']}]")
+            sentinel = object()
+            game = choose(entries + [sentinel], 'Steam game',
+                          lambda g: 'Not a Steam game (type a path)' if g is sentinel
+                          else f"{g['name']} [{g['appid']}]")
+            if game is sentinel:
+                return _enter_game_path()
             return games.select_executable(game['path'])
     try:
         return games.select_executable(root, args.exe)
@@ -132,11 +150,7 @@ def resolve_exe(args, interactive):
         if candidates:
             selected = choose(candidates, 'Game executable', lambda p: str(p.relative_to(root)))
             return games.select_executable(root, selected)
-        entered = input('Game directory or .exe path (empty to cancel): ').strip()
-        if entered:
-            path = Path(entered).expanduser().absolute()
-            return games.select_executable(path if path.is_dir() else path.parent,
-                                           None if path.is_dir() else path)
+        return _enter_game_path()
     raise RuntimeError('Specify --game-dir /path/game or --exe /path/game.exe; Steam lookup is optional with --appid ID.')
 
 
@@ -344,7 +358,13 @@ def main(argv=None):
         return 2
     args = parser().parse_args(arguments or ['install'])
     interactive = sys.stdin.isatty() and not getattr(args, 'json', False)
+    tui = terminal.Tui()
+    if interactive:
+        tui.start()
     try:
+        # In TTY mode the fixed header line already shows version and tagline.
+        if not args.json and not tui.enabled:
+            print(f'dlss5-amd-hip {VERSION} — {TAGLINE}')
         if args.command in ('list-games', 'list-protons'):
             if args.command == 'list-games':
                 rows = games.discover_games(args.steam_root)
@@ -482,3 +502,5 @@ def main(argv=None):
     except (EOFError, KeyboardInterrupt):
         print('Cancelled. Run status before your next operation.', file=sys.stderr)
         return 130
+    finally:
+        tui.stop()

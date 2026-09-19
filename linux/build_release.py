@@ -6,11 +6,15 @@ import hashlib
 import io
 import json
 from pathlib import Path
+import sys
 import tarfile
 
 HERE = Path(__file__).resolve().parent
 REPO = HERE.parent
 ARCHIVE = 'dlss5-amd-hip-linux'
+sys.path.insert(0, str(HERE))
+
+from dlssnr import VERSION as PACKAGE_VERSION
 
 
 def _add(tar: tarfile.TarFile, src: Path, dest: str, mode: int | None = None) -> dict:
@@ -76,6 +80,7 @@ def main() -> None:
         'dlssnr/runtime.py',
         'dlssnr/assets.py',
         'dlssnr/kernels.py',
+        'dlssnr/terminal.py',
     ]
     readme = (HERE / 'ARCHIVE-README.md').read_bytes() if (HERE / 'ARCHIVE-README.md').is_file() else (HERE / 'README.md').read_bytes()
     flags = (REPO / 'scripts' / 'game-flags.txt').read_text()
@@ -117,7 +122,7 @@ def main() -> None:
             add_file(minhook_lic, 'licenses/MinHook-LICENSE.txt')
             for notice in sorted((HERE / 'vendor' / 'notices').glob('*')):
                 add_file(notice, 'licenses/' + notice.name)
-            manifest = {'schema': 1, 'version': '1.0', 'minimum_glibc': '2.34',
+            manifest = {'schema': 1, 'version': PACKAGE_VERSION, 'minimum_glibc': '2.34',
                         'purpose': 'experimental native HIP DLSS5 network; per-frame optimization ongoing',
                         'source_url': 'https://github.com/guentra/dlss5-amd-hip-linux/tree/main',
                         'gameplay_verified': False, 'nvidia_equivalence_verified': False,
