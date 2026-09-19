@@ -68,6 +68,7 @@ class Tui:
         self.viewport_h = 0
         self._history = []
         self._pending = ''
+        self._art_drawn = False
 
     # -- lifecycle ---------------------------------------------------------
     def start(self) -> bool:
@@ -84,9 +85,8 @@ class Tui:
         self._shell = _Shell(self)
         sys.stdout = self._shell
         builtins.input = self._input
-        self._resize()
         self._raw('\x1b[2J\x1b[H')
-        self._draw_art()
+        self._resize()  # draws the art (geometry always changed on first call)
         self._render()
         return True
 
@@ -99,7 +99,7 @@ class Tui:
             self._pending = ''
         sys.stdout = self._real_stdout
         builtins.input = self._real_input
-        self._raw(f'\x1b[{self.rows};1H\x1b[K')
+        self._raw(f'\x1b[{self.rows};1H')
 
     # -- geometry ----------------------------------------------------------
     def _resize(self):
@@ -107,10 +107,15 @@ class Tui:
         if size.columns < self._art_w + GAP + MIN_LEFT or size.lines < 10:
             self._fallback()
             return
+        changed = size.columns != self.columns or size.lines != self.rows
         self.columns = size.columns
         self.rows = size.lines
         self.left_w = size.columns - self._art_w - GAP
         self.viewport_h = max(1, self.rows - 2)
+        if self.enabled and (changed or not self._art_drawn):
+            # Redraw the art in its new position; the left column never
+            # touches the art cells, so nothing else can move it.
+            self._draw_art()
 
     def _fallback(self):
         """Terminal became too small: finish the session in plain mode."""
@@ -130,13 +135,23 @@ class Tui:
         self._real_stdout.write(text)
         self._real_stdout.flush()
 
-    def _cell(self, row, col, text):
-        self._raw(f'\x1b[{row};{col}H{text}\x1b[K')
+    @property
+    def _art_col(self):
+        return self.left_w + GAP + 1
+
+    def _cell_left(self, row, text):
+        # Pad with spaces instead of ESC[K: a clear-to-end-of-line would wipe
+        # the art columns on the same row.
+        text = text[:self.left_w]
+        self._raw(f'\x1b[{row};1H{text.ljust(self.left_w)}')
+
+    def _cell_art(self, row, text):
+        self._raw(f'\x1b[{row};{self._art_col}H{text}\x1b[K')
 
     def _draw_art(self):
-        col = self.left_w + GAP + 1
         for row, line in enumerate(self._art[:self.rows]):
-            self._cell(row + 1, col, line)
+            self._cell_art(row + 1, line)
+        self._art_drawn = True
 
     def _wrap(self, text):
         if not text:
@@ -160,10 +175,10 @@ class Tui:
         self._resize()
         if not self.enabled:
             return
-        self._cell(1, 1, f'dlss5-amd-hip {VERSION} — {TAGLINE}'[:self.left_w])
+        self._cell_left(1, f'dlss5-amd-hip {VERSION} — {TAGLINE}')
         visible = self._visible()
         for offset, line in enumerate(visible):
-            self._cell(offset + 2, 1, line)
+            self._cell_left(offset + 2, line)
         if visible:
             self._raw(f'\x1b[{len(visible) + 1};{len(visible[-1]) + 1}H')
 
