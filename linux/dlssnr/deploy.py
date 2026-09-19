@@ -35,6 +35,24 @@ HIP_NOTES = [
 ]
 
 
+def bridge_cache_path(digest):
+    """Shared LD_PRELOAD target for the HIP bridge library.
+
+    The ELF loader splits LD_PRELOAD on whitespace, so the preloaded library
+    can never live under a path containing spaces. Game install directories
+    often do (for example 'SILENT HILL f'), so the preload target is a
+    per-digest copy under the user data directory, shared between games and
+    retained on uninstall.
+    """
+    root = Path(os.environ.get('XDG_DATA_HOME') or (Path.home() / '.local' / 'share'))
+    path = root / 'dlss5-hip' / 'bridges' / (digest + '.so')
+    if any(ch.isspace() for ch in str(path)) or ':' in str(path):
+        raise RuntimeError(
+            'Bridge cache path must not contain whitespace or colon (LD_PRELOAD '
+            'limit): ' + str(path) + '; set XDG_DATA_HOME to a safe path and reinstall')
+    return path
+
+
 def _safe(path, *, directory=False, missing=False):
     path = Path(os.path.abspath(path))
     current = Path(path.anchor)
@@ -397,12 +415,19 @@ def status_game(exe):
         if changed:
             return {'installed': True, 'valid': False, 'pending': True,
                     'notes': ['Changed deployed files: ' + ', '.join(changed[:8])]}
+        if data.get('bridge_cache'):
+            cache = Path(data['bridge_cache'])
+            if not (cache.is_file() and _digest(cache) == data.get('bridge_cache_sha256')):
+                return {'installed': True, 'valid': False, 'pending': True,
+                        'notes': ['Bridge cache missing or changed: ' + str(cache)
+                                  + '; reinstall before launching']}
         return dict({'installed': True, 'valid': True, 'pending': False,
                      'hip': data.get('hip', False),
                      'notes': list(HIP_NOTES if data.get('hip', False) else NOTES),
                      'mode': data.get('mode'), 'package': data.get('package'),
                      'weights': data.get('weights'), 'gpu': data.get('gpu'),
-                     'hip_library': data.get('hip_library')}, **prefix_paths(exe))
+                     'hip_library': data.get('hip_library'),
+                     'bridge_cache': data.get('bridge_cache')}, **prefix_paths(exe))
     except (RuntimeError, OSError, ValueError) as exc:
         return {'installed': True, 'valid': False, 'pending': True, 'notes': [str(exc)]}
 
@@ -597,20 +622,26 @@ def install_hip(exe, weights_root, *, magpie=False, replace_existing=False,
         library = Path(hip_library).expanduser().absolute() if hip_library else None
         so_digest = package.sha256(hip_files['so']) if hip_files['so'].is_file() else None
         library_digest = package.sha256(library) if library is not None and library.is_file() else None
+        # LD_PRELOAD cannot contain whitespace, so the preload target is a
+        # per-digest cache copy, not the game-directory staged library.
+        cache = bridge_cache_path(so_digest) if so_digest else None
         wrapper = wrapper_bytes(exe, magpie=magpie, gpu_name=gpu_name, hip=True,
-                                hip_so=store / 'lib' / 'libdlss5_hip.so', gpu=gpu,
+                                hip_so=cache or (store / 'lib' / 'libdlss5_hip.so'), gpu=gpu,
                                 so_digest=so_digest, hip_library=library,
                                 hip_library_digest=library_digest)
         result = dict({'installed': False, 'valid': False, 'dry_run': dry_run, 'notes': list(HIP_NOTES),
                        'mode': 'magpie' if magpie else 'game', 'hip': True,
                        'weights': str(weights), 'gpu': gpu,
-                       'hip_library': str(library) if library else None}, **prefix_paths(exe))
+                       'hip_library': str(library) if library else None,
+                       'bridge_cache': str(cache) if cache else None}, **prefix_paths(exe))
         if dry_run:
             result['collisions'] = collisions
             return result
         data = _begin_install(exe, hip=True, mode='magpie' if magpie else 'game', weights=str(weights),
                               gpu=gpu, hip_library=str(library) if library else None,
-                              hip_library_sha256=library_digest)
+                              hip_library_sha256=library_digest,
+                              bridge_cache=str(cache) if cache else None,
+                              bridge_cache_sha256=so_digest)
         for name in ('backups', 'logs', 'lib'):
             (store / name).mkdir(mode=0o700, exist_ok=True)
         files = data['files']
@@ -639,6 +670,8 @@ def install_hip(exe, weights_root, *, magpie=False, replace_existing=False,
             _overlay(exe, 'd3d12core.dll', hip_files['vkd3dcore'], files, store)
             _overlay_bytes(exe, 'ReShade.ini', proxy_ini, files, store)
         _overlay(exe, STORE + '/lib/libdlss5_hip.so', hip_files['so'], files, store)
+        if cache is not None:
+            _atomic_copy(hip_files['so'], cache, expected=so_digest, mode=0o644)
         flags_src = hip_files.get('flags')
         flags_text = flags_src.read_text() if flags_src.is_file() else ''
         if 'DLSS5_HIP=' not in flags_text:

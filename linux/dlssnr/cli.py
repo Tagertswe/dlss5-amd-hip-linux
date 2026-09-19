@@ -333,6 +333,8 @@ def emit(result, args):
         print('GPU:', result['gpu']['name'])
     if result.get('hip_library'):
         print('HIP runtime:', result['hip_library'])
+    if result.get('bridge_cache'):
+        print('HIP bridge cache (LD_PRELOAD target):', result['bridge_cache'])
     if result.get('proton'):
         print('Use this Wine/Proton runner in your launcher:', result['proton'])
     if result.get('command_prefix'):

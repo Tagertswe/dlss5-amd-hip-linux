@@ -1,6 +1,7 @@
 """Local HIP staging regressions; never install into an actual game."""
 from pathlib import Path
 import json
+import os
 import sys
 import tempfile
 import unittest
@@ -25,6 +26,16 @@ def fixture(root):
 
 
 class HipStagingSafetyTests(unittest.TestCase):
+    def setUp(self):
+        # Keep the shared LD_PRELOAD bridge cache out of the real user home.
+        self._xdg = tempfile.TemporaryDirectory()
+        self._patcher = patch.dict(os.environ, {'XDG_DATA_HOME': self._xdg.name})
+        self._patcher.start()
+
+    def tearDown(self):
+        self._patcher.stop()
+        self._xdg.cleanup()
+
     def test_uninstall_checks_all_targets_before_restoring_any_and_keeps_notes(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

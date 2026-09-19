@@ -1,5 +1,8 @@
 #!/usr/bin/env python3
 import hashlib
+import os
+import re
+import shlex
 import sys
 import tempfile
 import unittest
@@ -220,18 +223,24 @@ class BackendIntentTests(unittest.TestCase):
             self.assertTrue(any('SM 6.10' in note for note in result['notes']))
             self.assertFalse(any('HIP path:' in note for note in result['notes']))
 
+    def _hip_install(self, root, game):
+        weights = root / 'weights'
+        _write(weights / 'block0.f16', b'\0\0')
+        artifacts = {key: root / 'artifacts' / key for key in ('so', 'dll', 'addon', 'reshade', 'flags')}
+        for key, path in artifacts.items():
+            _write(path, ('fixture-' + key).encode() if key != 'flags' else b'DLSS5_TILED_WEIGHTS=1\n')
+        exe = game / 'Game.exe'
+        _write(exe, b'MZ')
+        xdg = root / 'xdg'
+        with patch.object(deploy, 'ensure_hip_artifacts', return_value=artifacts), \
+             patch.dict(os.environ, {'XDG_DATA_HOME': str(xdg)}):
+            result = deploy.install_package(exe, weights, acknowledge_risk=True, hip=True)
+        return exe, xdg, result
+
     def test_explicit_hip_stays_hip(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
-            weights = root / 'weights'
-            _write(weights / 'block0.f16', b'\0\0')
-            artifacts = {key: root / 'artifacts' / key for key in ('so', 'dll', 'addon', 'reshade', 'flags')}
-            for key, path in artifacts.items():
-                _write(path, ('fixture-' + key).encode() if key != 'flags' else b'DLSS5_TILED_WEIGHTS=1\n')
-            exe = root / 'game' / 'Game.exe'
-            _write(exe, b'MZ')
-            with patch.object(deploy, 'ensure_hip_artifacts', return_value=artifacts):
-                result = deploy.install_package(exe, weights, acknowledge_risk=True, hip=True)
+            exe, xdg, result = self._hip_install(root, root / 'game')
             self.assertTrue(result['hip'])
             self.assertTrue(deploy.status_game(exe)['hip'])
             self.assertEqual((exe.parent / 'dlss5_hip.dll').read_bytes(), b'fixture-dll')
@@ -239,12 +248,60 @@ class BackendIntentTests(unittest.TestCase):
             wrapper = (exe.parent / deploy.STORE / 'launch.sh').read_text()
             self.assertIn('export LD_PRELOAD=', wrapper)
             self.assertIn('export DLSS5_HIP=1', wrapper)
+            preload = self._preload_target(wrapper)
+            self.assertTrue(preload.startswith(str(xdg)), preload)
+            self.assertEqual(Path(preload).read_bytes(), b'fixture-so')
+            journal = json.loads((exe.parent / deploy.STORE / 'manifest.json').read_text())
+            self.assertEqual(journal['bridge_cache'], preload)
+            self.assertEqual(deploy.status_game(exe)['bridge_cache'], preload)
             # A staged diagnostic must not arm known wait-based live rendering.
             for name in ('continuous-every-frame.txt', 'continuous-reset-preview.txt',
                          'temporal-history.txt', 'neural-frame-request.txt'):
                 self.assertFalse((exe.parent / 'DLSS5-AMD' / name).exists(), name)
             self.assertTrue(any('unverified' in note.lower() for note in result['notes']))
             self.assertFalse((exe.parent / 'DLSS5-D3D12-721').exists())
+
+    @staticmethod
+    def _preload_target(wrapper):
+        # The wrapper exports LD_PRELOAD="$so..."; the target is the so= line.
+        match = re.search(r'^so=(.+)$', wrapper, re.M)
+        if not match:
+            raise AssertionError('no so= line in wrapper')
+        return shlex.split(match.group(1))[0]
+
+    def test_hip_preload_target_survives_whitespace_game_path(self):
+        # 'SILENT HILL f': the game directory contains a space, which the ELF
+        # loader would split out of LD_PRELOAD, so the preload target must be
+        # the whitespace-free cache copy, never the in-game staged library.
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            game = root / 'SILENT HILL f' / 'SHf' / 'Binaries' / 'Win64'
+            exe, xdg, result = self._hip_install(root, game)
+            self.assertTrue(result['valid'])
+            wrapper = (exe.parent / deploy.STORE / 'launch.sh').read_text()
+            preload = self._preload_target(wrapper)
+            self.assertNotIn(' ', preload)
+            self.assertTrue(preload.startswith(str(xdg)), preload)
+            self.assertEqual(Path(preload).read_bytes(), b'fixture-so')
+            # The in-game staged copy stays journal-managed but is not preloaded.
+            self.assertEqual((game / deploy.STORE / 'lib/libdlss5_hip.so').read_bytes(), b'fixture-so')
+            self.assertNotIn(str(game), preload)
+
+    def test_hip_bridge_cache_refuses_whitespace_data_home(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            weights = root / 'weights'
+            _write(weights / 'block0.f16', b'\0\0')
+            artifacts = {key: root / 'artifacts' / key for key in ('so', 'dll', 'addon', 'reshade', 'flags')}
+            for key, path in artifacts.items():
+                _write(path, ('fixture-' + key).encode() if key != 'flags' else b'DLSS5_TILED_WEIGHTS=1\n')
+            game = root / 'game'
+            exe = game / 'Game.exe'
+            _write(exe, b'MZ')
+            with patch.object(deploy, 'ensure_hip_artifacts', return_value=artifacts), \
+                 patch.dict(os.environ, {'XDG_DATA_HOME': str(root / 'bad data home')}), \
+                 self.assertRaisesRegex(RuntimeError, 'whitespace'):
+                deploy.install_package(exe, weights, acknowledge_risk=True, hip=True)
 
     def test_explicit_d3d_dry_run_is_read_only(self):
         with tempfile.TemporaryDirectory() as tmp:

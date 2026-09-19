@@ -1,4 +1,5 @@
 from pathlib import Path
+import os
 import sys
 import tempfile
 import unittest
@@ -8,6 +9,16 @@ from linux.tests.test_hip_install_safety import fixture
 from dlssnr import deploy
 
 class LiveReleaseInstall(unittest.TestCase):
+    def setUp(self):
+        # Keep the shared LD_PRELOAD bridge cache out of the real user home.
+        self._xdg = tempfile.TemporaryDirectory()
+        self._patcher = patch.dict(os.environ, {'XDG_DATA_HOME': self._xdg.name})
+        self._patcher.start()
+
+    def tearDown(self):
+        self._patcher.stop()
+        self._xdg.cleanup()
+
     def test_live_pair_proxy_wrapper_and_uninstall(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
