@@ -55,6 +55,9 @@ def parser():
             command.add_argument('--accept-risk', action='store_true', help='Accept experimental injection risks')
             command.add_argument('--replace-existing', action='store_true', help='Back up and replace conflicting files')
             command.add_argument('--dry-run', action='store_true', help='No writes, downloads or conversion')
+        if name == 'install':
+            command.add_argument('--replace-foreign', action='store_true',
+                                 help='Remove a foreign dlssnr_on_amd deployment via its own uninstaller')
     command = commands.add_parser('runtime', help='Check or install a user-local HIP7 runtime')
     command.add_argument('--hip-library', type=Path)
     command.add_argument('--data-dir', type=Path)
@@ -413,6 +416,30 @@ def main(argv=None):
         info = dict(package.inspect_weights(weights_root, allow_derived_layouts=args.allow_derived_layouts),
                     mode='magpie' if args.magpie else 'game', hip=True)
         warnings = build_warnings(info, weights_root, exe)
+        foreign = deploy.foreign_deployment(exe)
+        if foreign is not None:
+            if args.command == 'doctor':
+                warnings.append('Foreign dlssnr_on_amd deployment present; install requires '
+                                '--replace-foreign (or interactive consent) to remove it first.')
+            elif args.dry_run:
+                warnings.append('Foreign dlssnr_on_amd deployment present; the real install requires '
+                                '--replace-foreign to remove it via its own uninstaller first.')
+                emit({'dry_run': True, 'installed': False, 'valid': False, 'foreign': True,
+                      'warnings': warnings, 'notes': []}, args)
+                return 0
+            elif args.replace_foreign:
+                deploy.remove_foreign_deployment(exe)
+                if not args.json:
+                    print('Removed the foreign dlssnr_on_amd deployment via its own uninstaller.')
+            elif interactive:
+                require(False, True,
+                        'A foreign dlssnr_on_amd deployment owns this game directory. '
+                        'Remove it via its own uninstaller and continue?', '--replace-foreign')
+                deploy.remove_foreign_deployment(exe)
+                print('Removed the foreign dlssnr_on_amd deployment via its own uninstaller.')
+            else:
+                raise RuntimeError('A foreign dlssnr_on_amd deployment owns this game directory; '
+                                   're-run with --replace-foreign to remove it via its own uninstaller.')
         if args.command == 'doctor':
             rt = readonly_runtime(args)
             gpu = select_gpu(rt['devices'], args.gpu, interactive, bundled_targets())

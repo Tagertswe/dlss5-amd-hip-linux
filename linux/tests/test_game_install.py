@@ -90,6 +90,117 @@ class DeployTests(unittest.TestCase):
             self.assertFalse((game / '.dlssnr-linux').exists())
 
 
+FAKE_FOREIGN_UNINSTALLER = b'''#!/usr/bin/env python3
+import json, shutil, sys
+from pathlib import Path
+args = sys.argv[1:]
+if args[:1] != ['uninstall'] or '--exe' not in args or '--yes' not in args:
+    raise SystemExit(2)
+exe = Path(args[args.index('--exe') + 1])
+game = exe.parent
+store = game / '.dlssnr-linux'
+data = json.loads((store / 'manifest.json').read_text())
+if data.get('schema') != 1 or data.get('exe') != str(exe):
+    raise SystemExit('refusing foreign manifest')
+for name in data['files']:
+    target = game / name
+    if target.exists():
+        target.unlink()
+shutil.rmtree(store)
+print(json.dumps({'installed': False, 'valid': False, 'removed': True}))
+'''
+
+
+def _foreign_item(payload: bytes, *, preserve: bool = False) -> dict:
+    return {'sha256': hashlib.sha256(payload).hexdigest(), 'mode': 0o644,
+            'original': None, 'original_mode': None, 'preserve': preserve, 'touched': True}
+
+
+def _install_foreign(game: Path, exe: Path, *, drift_ini: bool = False, staging: bool = True):
+    payloads = {'d3d12.dll': b'foreign-d3d12', 'd3d12core.dll': b'foreign-core',
+                'dlssnr_on_amd.ini': b'[PROXY]\n', 'dlssnr_on_amd_weights.bin': b'w'}
+    files = {name: _foreign_item(data) for name, data in payloads.items()}
+    store = game / deploy.STORE
+    (store / 'backups').mkdir(parents=True, exist_ok=True)
+    journal = {'schema': 1, 'exe': str(exe), 'state': 'installed', 'files': files,
+               'request': 'f09c0a6347c91137a95635e2c5fc5991e8227063eca630f03b777b2677a6433a',
+               'cache': str(game / 'cache'), 'undo': {}}
+    _write(store / 'manifest.json', json.dumps(journal, indent=2).encode())
+    on_disk = dict(payloads)
+    if drift_ini:
+        on_disk['dlssnr_on_amd.ini'] = b'[PROXY]\nRewrittenAtRuntime=1\n'
+    for name, data in on_disk.items():
+        _write(game / name, data)
+    if staging:
+        staging_dir = game / 'dlssnr-linux-portable'
+        (staging_dir / 'dlssnr').mkdir(parents=True)
+        _write(staging_dir / 'PROVENANCE.json', b'{"schema": 1}')
+        _write(staging_dir / 'installer.py', FAKE_FOREIGN_UNINSTALLER)
+
+
+class ForeignDeploymentTests(unittest.TestCase):
+    def test_foreign_journal_is_detected_and_refused(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            pkg = _fake_package(root / 'pkg')
+            game = root / 'game'
+            exe = game / 'Game.exe'
+            _write(exe, b'MZ')
+            _install_foreign(game, exe)
+            self.assertIsNotNone(deploy.foreign_deployment(exe))
+            status = deploy.status_game(exe)
+            self.assertFalse(status['installed'])
+            self.assertTrue(status.get('foreign'))
+            self.assertTrue(any('--replace-foreign' in note for note in status['notes']))
+            with self.assertRaisesRegex(RuntimeError, r'--replace-foreign'):
+                deploy.install_package(exe, pkg, acknowledge_risk=True, replace_existing=True)
+            self.assertTrue((game / 'd3d12.dll').exists())
+
+    def test_replace_foreign_removes_then_installs(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            pkg = _fake_package(root / 'pkg')
+            game = root / 'game'
+            exe = game / 'Game.exe'
+            _write(exe, b'MZ')
+            _install_foreign(game, exe, drift_ini=True)
+            removed = deploy.remove_foreign_deployment(exe)
+            self.assertEqual(len(removed['files']), 4)
+            self.assertFalse((game / deploy.STORE).exists())
+            self.assertFalse((game / 'd3d12.dll').exists())
+            result = deploy.install_package(exe, pkg, acknowledge_risk=True)
+            self.assertTrue(result['valid'])
+            journal = json.loads((game / deploy.STORE / 'manifest.json').read_text())
+            self.assertEqual(journal['kind'], 'dlss5')
+
+    def test_replace_foreign_requires_staged_uninstaller(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            game = root / 'game'
+            exe = game / 'Game.exe'
+            _write(exe, b'MZ')
+            _install_foreign(game, exe, staging=False)
+            with self.assertRaisesRegex(RuntimeError, 'installer'):
+                deploy.remove_foreign_deployment(exe)
+            self.assertTrue((game / deploy.STORE).exists())
+
+    def test_unknown_journal_is_still_refused(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            pkg = _fake_package(root / 'pkg')
+            game = root / 'game'
+            exe = game / 'Game.exe'
+            _write(exe, b'MZ')
+            store = game / deploy.STORE
+            store.mkdir()
+            other = {'schema': 9, 'kind': 'otherproduct', 'exe': str(exe),
+                     'state': 'installed', 'files': {}}
+            _write(store / 'manifest.json', json.dumps(other).encode())
+            self.assertIsNone(deploy.foreign_deployment(exe))
+            with self.assertRaisesRegex(RuntimeError, 'refusing mutation'):
+                deploy.install_package(exe, pkg, acknowledge_risk=True, replace_existing=True)
+
+
 class BackendIntentTests(unittest.TestCase):
     def test_d3d_default_never_looks_up_hip(self):
         with tempfile.TemporaryDirectory() as tmp:

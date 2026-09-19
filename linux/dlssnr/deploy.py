@@ -11,6 +11,8 @@ import os
 from pathlib import Path
 import shlex
 import stat
+import subprocess
+import sys
 import tempfile
 
 from . import package
@@ -257,9 +259,107 @@ def _load(exe):
             raise RuntimeError(f'Invalid deployment journal digest: {name}')
         original = item.get('original')
         if original is not None and (not isinstance(original, str) or len(original) != 64
-                                    or any(c not in '0123456789abcdef' for c in original)):
+                                     or any(c not in '0123456789abcdef' for c in original)):
             raise RuntimeError(f'Invalid deployment original digest: {name}')
     return data
+
+
+FOREIGN_STORE_KEYS = frozenset({'schema', 'exe', 'state', 'files', 'request', 'cache', 'undo'})
+
+
+def foreign_deployment(exe):
+    """Detect a live deployment owned by the foreign dlssnr_on_amd product.
+
+    Its journal is schema 1 with a distinct key set; we never mutate it
+    ourselves, only remove it through its own staged uninstaller.
+    """
+    exe = _exe(exe)
+    store = exe.parent / STORE
+    manifest = store / 'manifest.json'
+    if not store.is_dir() or manifest.is_symlink() or not manifest.is_file():
+        return None
+    try:
+        data = json.loads(_safe(manifest).read_text())
+    except (OSError, ValueError):
+        return None
+    if type(data) is not dict or set(data) != FOREIGN_STORE_KEYS or data.get('schema') != 1:
+        return None
+    if data.get('exe') != str(exe) or type(data.get('files')) is not dict or not data['files']:
+        return None
+    if data.get('state') not in {'installed', 'installing', 'uninstalling'}:
+        return None
+    for name, item in data['files'].items():
+        parts = name.split('/')
+        if (type(name) is not str or not name or name.startswith('/')
+                or any(p in {'', '.', '..'} for p in parts) or '\\' in name or ':' in name
+                or type(item) is not dict or 'sha256' not in item or 'original' not in item
+                or 'touched' not in item or 'preserve' not in item or 'mode' not in item):
+            return None
+    return data
+
+
+def remove_foreign_deployment(exe, *, timeout=300):
+    """Remove the foreign deployment by running its own staged uninstaller.
+
+    Must be called without holding the game directory lock: the foreign
+    uninstaller takes the same directory flock.
+    """
+    exe = _exe(exe)
+    data = foreign_deployment(exe)
+    if data is None:
+        raise RuntimeError('No foreign deployment found for this game.')
+    staging = exe.parent / 'dlssnr-linux-portable'
+    if staging.is_symlink() or not staging.is_dir():
+        raise RuntimeError('The foreign installer directory is missing or incomplete; run its '
+                           'own uninstall (dlssnr-linux-portable/install.sh uninstall) manually.')
+    _safe(staging, directory=True)
+    for required in ('installer.py', 'dlssnr', 'PROVENANCE.json'):
+        path = staging / required
+        present = path.is_dir() if required == 'dlssnr' else path.is_file()
+        if path.is_symlink() or not present:
+            raise RuntimeError('The foreign installer directory is missing or incomplete; run its '
+                               'own uninstall (dlssnr-linux-portable/install.sh uninstall) manually.')
+        _safe(path, directory=required == 'dlssnr')
+    try:
+        result = subprocess.run([sys.executable, '-B', str(staging / 'installer.py'),
+                                 'uninstall', '--exe', str(exe), '--yes', '--json'],
+                                capture_output=True, text=True, timeout=timeout,
+                                cwd=str(staging), stdin=subprocess.DEVNULL)
+    except subprocess.TimeoutExpired as exc:
+        raise RuntimeError('Foreign uninstaller timed out; finish it manually '
+                           '(dlssnr-linux-portable/install.sh uninstall) and re-run.') from exc
+    if result.returncode != 0:
+        raise RuntimeError('Foreign deployment removal failed; finish it with the original '
+                           'uninstaller (dlssnr-linux-portable/install.sh uninstall):\n'
+                           + (result.stdout + result.stderr)[-2000:])
+    manifest = exe.parent / STORE / 'manifest.json'
+    if manifest.is_file() and not manifest.is_symlink():
+        try:
+            after = json.loads(manifest.read_text())
+        except ValueError:
+            after = {}
+        if after.get('state') != 'removed' or after.get('files'):
+            raise RuntimeError('Foreign removal left a live journal; inspect '
+                               '.dlssnr-linux/manifest.json before continuing.')
+    for name, item in data['files'].items():
+        if item.get('preserve'):
+            continue
+        target = exe.parent / name
+        if target.exists() or target.is_symlink():
+            raise RuntimeError(f'Foreign removal incomplete: {name} is still present; '
+                               'inspect the game directory before continuing.')
+    return data
+
+
+def _previous_or_foreign(exe, store, *, dry_run):
+    if not store.exists():
+        return {}
+    if foreign_deployment(exe) is not None:
+        if not dry_run:
+            raise RuntimeError('A foreign dlssnr_on_amd deployment owns this game directory; '
+                               're-run with --replace-foreign to remove it via its own uninstaller.')
+        return {}
+    return _load(exe)
 
 
 def prefix_paths(exe):
@@ -276,6 +376,11 @@ def status_game(exe):
     store = exe.parent / STORE
     if not store.exists():
         return {'installed': False, 'valid': False, 'pending': False, 'notes': []}
+    foreign = foreign_deployment(exe)
+    if foreign is not None:
+        return {'installed': False, 'valid': False, 'pending': False, 'foreign': True,
+                'notes': ['Foreign dlssnr_on_amd deployment present (not managed by this installer); '
+                          'use install --replace-foreign to remove it via its own uninstaller.']}
     try:
         data = _load(exe)
         if data.get('state') == 'removed':
@@ -470,7 +575,7 @@ def install_hip(exe, weights_root, *, magpie=False, replace_existing=False,
         for relative in targets:
             if (exe.parent / relative).exists():
                 collisions.append(relative)
-        previous = _load(exe) if store.exists() else {}
+        previous = _previous_or_foreign(exe, store, dry_run=dry_run)
         managed = previous.get('files', {}) if previous.get('state') == 'installed' else {}
         unmanaged = [name for name in collisions if name not in managed]
         if unmanaged and not replace_existing:
@@ -572,7 +677,7 @@ def install_package(exe, package_root, *, magpie=False, replace_existing=False,
             planned.append(relative)
             if target.exists():
                 collisions.append(relative)
-        previous = _load(exe) if store.exists() else {}
+        previous = _previous_or_foreign(exe, store, dry_run=dry_run)
         managed = previous.get('files', {}) if previous.get('state') == 'installed' else {}
         unmanaged = [name for name in collisions if name not in managed]
         if unmanaged and not replace_existing:
