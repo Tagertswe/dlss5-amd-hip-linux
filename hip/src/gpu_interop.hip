@@ -161,6 +161,7 @@ int handle_to_fd(void* handle) {
 struct ImportEntry {
   void* handle;
   size_t size;
+  uint32_t gen;
   int fd;
   hipExternalMemory_t ext;
   void* dev;
@@ -170,11 +171,11 @@ std::mutex g_import_mu;
 
 }  // namespace
 
-bool map_device(void* handle, size_t size, void** dev) {
+bool map_device(void* handle, size_t size, uint32_t generation, void** dev) {
   if (!handle || !size || !dev) return false;
   std::lock_guard<std::mutex> lk(g_import_mu);
   for (const auto& e : g_imports)
-    if (e.handle == handle && e.size == size) {
+    if (e.handle == handle && e.size == size && e.gen == generation) {
       *dev = e.dev;
       return true;
     }
@@ -200,7 +201,7 @@ bool map_device(void* handle, size_t size, void** dev) {
     close(d.handle.fd);
     return false;
   }
-  g_imports.push_back({handle, size, d.handle.fd, ext, ptr});
+  g_imports.push_back({handle, size, generation, d.handle.fd, ext, ptr});
   *dev = ptr;
   return true;
 }

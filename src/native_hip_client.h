@@ -11,13 +11,14 @@
 #include "../hip/include/dlss5_capi.h"
 
 class NativeHipClient {
- using InitFn=int(*)(const char*,int);
- using RunFn=int(*)(const float*,float*,unsigned);
- using FrameFn=int(*)(const Dlss5Frame*);
- using ErrFn=const char*(*)();
- using ShutFn=void(*)();
- HMODULE dll{};InitFn p_init{};RunFn p_run{};ErrFn p_err{};ShutFn p_shut{};bool ready_{};
- FrameFn p_frame{};bool initialized_{};
+  using InitFn=int(*)(const char*,int);
+  using RunFn=int(*)(const float*,float*,unsigned);
+  using FrameFn=int(*)(const Dlss5Frame*);
+  using FrameRawFn=int(*)(const Dlss5FrameRaw*);
+  using ErrFn=const char*(*)();
+  using ShutFn=void(*)();
+  HMODULE dll{};InitFn p_init{};RunFn p_run{};ErrFn p_err{};ShutFn p_shut{};bool ready_{};
+  FrameFn p_frame{};FrameRawFn p_frame_raw{};bool initialized_{};
  // One reservation across instances, including loading/initializing/cleanup.
  // The same mutex serializes calls so shutdown cannot race a wrapper run.
  static std::mutex& Mutex(){static std::mutex mutex;return mutex;}
@@ -26,7 +27,7 @@ class NativeHipClient {
   if(initialized_&&p_shut)p_shut();
   ready_=false;initialized_=false;
   if(dll)FreeLibrary(dll);
-  dll=nullptr;p_init=nullptr;p_run=nullptr;p_frame=nullptr;p_err=nullptr;p_shut=nullptr;
+   dll=nullptr;p_init=nullptr;p_run=nullptr;p_frame=nullptr;p_frame_raw=nullptr;p_err=nullptr;p_shut=nullptr;
   if(Owner()==this)Owner()=nullptr;
  }
  static void Log(const char*e,const char*d=""){
@@ -53,12 +54,14 @@ public:
   std::wstring dll_path=dir+L"\\dlss5_hip.dll";
   dll=LoadLibraryW(dll_path.c_str());
   if(!dll){Log("hip_load_failed","dlss5_hip.dll");throw std::runtime_error("dlss5_hip.dll missing (HIP trampoline)");}
-  p_init=reinterpret_cast<InitFn>(GetProcAddress(dll,"dlss5_init"));
-  p_run=reinterpret_cast<RunFn>(GetProcAddress(dll,"dlss5_run"));
-  p_frame=reinterpret_cast<FrameFn>(GetProcAddress(dll,"dlss5_run_frame"));
-  p_err=reinterpret_cast<ErrFn>(GetProcAddress(dll,"dlss5_last_error"));
-  p_shut=reinterpret_cast<ShutFn>(GetProcAddress(dll,"dlss5_shutdown"));
-  if(!p_init||!p_run||!p_frame||!p_err||!p_shut)throw std::runtime_error("dlss5_hip.dll exports missing; rebuild the HIP bridge");
+   p_init=reinterpret_cast<InitFn>(GetProcAddress(dll,"dlss5_init"));
+   p_run=reinterpret_cast<RunFn>(GetProcAddress(dll,"dlss5_run"));
+   p_frame=reinterpret_cast<FrameFn>(GetProcAddress(dll,"dlss5_run_frame"));
+   // V3 GPU-resident raw path (optional): present only on the matching rebuild.
+   p_frame_raw=reinterpret_cast<FrameRawFn>(GetProcAddress(dll,"dlss5_run_frame_raw_gpu"));
+   p_err=reinterpret_cast<ErrFn>(GetProcAddress(dll,"dlss5_last_error"));
+   p_shut=reinterpret_cast<ShutFn>(GetProcAddress(dll,"dlss5_shutdown"));
+   if(!p_init||!p_run||!p_frame||!p_err||!p_shut)throw std::runtime_error("dlss5_hip.dll exports missing; rebuild the HIP bridge");
   int gpu=0;
   if(adapter_name){
    using FindFn=int(*)(const char*);
@@ -90,16 +93,31 @@ public:
   if(rc&&p_err)Log("hip_run_failed",p_err());
   return rc;
  }
- int RunFrame(const float*rgba,float*rgb,unsigned seed,bool display_srgb){
-  std::lock_guard<std::mutex> lock(Mutex());
-  if(!ready_||!p_frame)return -1;
-  Dlss5Frame f{};f.struct_size=sizeof f;f.flags=display_srgb?1:0;f.rgba=rgba;f.rgb=rgb;
-  f.seed=seed;f.reset=1;f.paper_white=f.transfer=f.color=1;
-  // The D3D bridge does not invent missing motion vectors. Host-side temporal
-  // callers use run_frame with explicit XY buffers; this path resets history.
-  int rc=p_frame(&f);if(rc&&p_err)Log("hip_run_failed",p_err());return rc;
- }
- ~NativeHipClient(){std::lock_guard<std::mutex> lock(Mutex());Release();}
+  int RunFrame(const float*rgba,float*rgb,unsigned seed,bool display_srgb){
+   std::lock_guard<std::mutex> lock(Mutex());
+   if(!ready_||!p_frame)return -1;
+   Dlss5Frame f{};f.struct_size=sizeof f;f.flags=display_srgb?1:0;f.rgba=rgba;f.rgb=rgb;
+   f.seed=seed;f.reset=1;f.paper_white=f.transfer=f.color=1;
+   // The D3D bridge does not invent missing motion vectors. Host-side temporal
+   // callers use run_frame with explicit XY buffers; this path resets history.
+   int rc=p_frame(&f);if(rc&&p_err)Log("hip_run_failed",p_err());return rc;
+  }
+  // V3 GPU-resident path: packed pixels stay on the GPU in DEFAULT-heap buffers.
+  // in/out handles are Win32 D3D12 shared handles (imported into HIP by the .so).
+  // Semantics match RunFrame: RGB replaced, alpha exact; on reject out keeps a
+  // copy of in (the caller guarantees that via a prefix in->out GPU copy).
+  bool HasRawGpu()const{std::lock_guard<std::mutex> lock(Mutex());return ready_&&p_frame_raw!=nullptr;}
+  int RunFrameRaw(void*in_handle,void*out_handle,unsigned width,unsigned height,unsigned dxgi_format,
+                  unsigned seed,bool display_srgb,unsigned handle_gen){
+   std::lock_guard<std::mutex> lock(Mutex());
+   if(!ready_||!p_frame_raw)return -1;
+   Dlss5FrameRaw f{};f.struct_size=sizeof f;
+   f.in_handle=in_handle;f.out_handle=out_handle;f.width=width;f.height=height;
+   f.dxgi_format=dxgi_format;f.seed=seed;f.flags=display_srgb?DLSS5_HIP_RAW_FLAGS_SRGB:0;
+   f.paper_white=f.transfer=f.color=1;f.handle_gen=handle_gen;
+   int rc=p_frame_raw(&f);if(rc&&p_err)Log("hip_raw_frame_failed",p_err());return rc;
+  }
+  ~NativeHipClient(){std::lock_guard<std::mutex> lock(Mutex());Release();}
 };
 
 #include "native_frame_input_check.h"

@@ -8,8 +8,9 @@ enum Fmt { FmtUnsupported = 0, FmtRgba8 = 1, FmtBgra8 = 2, FmtR16Unorm = 3, FmtR
 
 Fmt format_from_dxgi(unsigned format);
 // Win32 D3D12 shared handle -> dma-buf fd -> hipImportExternalMemory; cached for the
-// process lifetime. Returns false when no fd could be obtained or the import failed.
-bool map_device(void* handle, size_t size, void** dev);
+// process lifetime, keyed by (handle, size, generation) because kernel object handle
+// values can be reused after close. Returns false on fd/import failure.
+bool map_device(void* handle, size_t size, uint32_t generation, void** dev);
 // Device kernel launches on the default stream (bit-exact CPU pipeline replicas).
 void launch_px_to_rgba(const uint8_t* dev_in, float* out, int w, int h, unsigned dxgi_format);
 void launch_rgb_to_pix(const float* rgb, const uint8_t* alpha_src, uint8_t* out, int w, int h,

@@ -309,8 +309,8 @@ extern "C" int dlss5_run_frame_raw_gpu(const Dlss5FrameRaw* f) {
         void* dev_in=nullptr,* dev_out=nullptr;
         if (dev_ptrs) {dev_in=f->in_handle;dev_out=f->out_handle;}
         else {
-            if (!dlss5::gpu::map_device(f->in_handle,bytes,&dev_in)) throw std::runtime_error("cannot import input handle");
-            if (!dlss5::gpu::map_device(f->out_handle,bytes,&dev_out)) throw std::runtime_error("cannot import output handle");
+            if (!dlss5::gpu::map_device(f->in_handle,bytes,f->handle_gen,&dev_in)) throw std::runtime_error("cannot import input handle");
+            if (!dlss5::gpu::map_device(f->out_handle,bytes,f->handle_gen,&dev_out)) throw std::runtime_error("cannot import output handle");
         }
         const auto fmt=dlss5::gpu::format_from_dxgi(f->dxgi_format);
         auto bypass=[&]() {

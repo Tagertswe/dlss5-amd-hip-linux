@@ -22,6 +22,7 @@ class NativeHipLive {
         ~Ref(){if(p)p->Release();}
         T** Out(){return &p;}
         T* operator->()const{return p;}
+        void Reset(){if(p){p->Release();p=nullptr;}}
     };
     static void Log(const char* event,uint64_t frame=0,const char* detail="",size_t changed=0) noexcept {
         try {
@@ -45,6 +46,19 @@ class NativeHipLive {
         std::atomic<unsigned> inflight{0};
         std::mutex recording,processing;
         bool display_srgb{};
+        // V3 GPU-resident frame buffers, shared by all jobs: the D3D queue and the
+        // serialized HIP callbacks order every in/out use in frame order, so one
+        // pair is race-free. Handles are created once and kept open for the state
+        // lifetime; buf_gen disambiguates the HIP import cache across recreation.
+        Ref<ID3D12Resource> in_buf,out_buf;
+        HANDLE in_handle{},out_handle{};
+        unsigned buf_w{},buf_h{},buf_dxgi{};
+        size_t buf_bytes{};
+        uint32_t buf_gen{0};
+        ~State(){
+            if(in_handle)CloseHandle(in_handle);
+            if(out_handle)CloseHandle(out_handle);
+        }
     };
     std::shared_ptr<State> state_=std::make_shared<State>();
     static constexpr unsigned MaxInflight=3;
@@ -60,34 +74,8 @@ class NativeHipLive {
     }
     struct DeviceResources {
         Ref<ID3D12Device> device;
-        Ref<ID3D12Resource> color,readback,upload;
-        D3D12_PLACED_SUBRESOURCE_FOOTPRINT fp{};
-        UINT64 bytes{};
-        unsigned char* mapped{};
-        ~DeviceResources(){if(mapped&&upload.p)upload->Unmap(0,nullptr);}
-        bool Create(ID3D12Device* d,ID3D12Resource* c,const D3D12_RESOURCE_DESC& desc,size_t bpp){
-            device.p=d;d->AddRef();color.p=c;c->AddRef();
-            UINT rows=0;UINT64 rowbytes=0;
-            d->GetCopyableFootprints(&desc,0,1,0,&fp,&rows,&rowbytes,&bytes);
-            const UINT64 packed=desc.Width*bpp;
-            if(rows!=desc.Height||rowbytes!=packed||fp.Footprint.Width!=desc.Width||
-               fp.Footprint.Height!=desc.Height||fp.Footprint.Depth!=1||fp.Footprint.Format!=desc.Format||
-               fp.Footprint.RowPitch<packed||!bytes||bytes>std::numeric_limits<SIZE_T>::max()||
-               fp.Offset>bytes||UINT64(rows-1)*fp.Footprint.RowPitch+packed>bytes-fp.Offset)return false;
-            D3D12_RESOURCE_DESC buffer{};buffer.Dimension=D3D12_RESOURCE_DIMENSION_BUFFER;
-            buffer.Width=bytes;buffer.Height=1;buffer.DepthOrArraySize=buffer.MipLevels=1;
-            buffer.SampleDesc.Count=1;buffer.Layout=D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
-            D3D12_HEAP_PROPERTIES heap{};heap.CreationNodeMask=heap.VisibleNodeMask=1;
-            heap.Type=D3D12_HEAP_TYPE_READBACK;
-            if(FAILED(d->CreateCommittedResource(&heap,D3D12_HEAP_FLAG_NONE,&buffer,
-                D3D12_RESOURCE_STATE_COPY_DEST,nullptr,IID_PPV_ARGS(readback.Out()))))return false;
-            heap.Type=D3D12_HEAP_TYPE_UPLOAD;
-            if(FAILED(d->CreateCommittedResource(&heap,D3D12_HEAP_FLAG_NONE,&buffer,
-                D3D12_RESOURCE_STATE_GENERIC_READ,nullptr,IID_PPV_ARGS(upload.Out()))))return false;
-            D3D12_RANGE none{};void* ptr=nullptr;
-            if(FAILED(upload->Map(0,&none,&ptr))||!ptr)return false;
-            mapped=static_cast<unsigned char*>(ptr);return true;
-        }
+        Ref<ID3D12Resource> color;
+        void Bind(ID3D12Device* d,ID3D12Resource* c){device.p=d;d->AddRef();color.p=c;c->AddRef();}
     };
     struct Job final: IUnknown {
         std::atomic<ULONG> refs{1};
@@ -97,9 +85,10 @@ class NativeHipLive {
         const GUID anchor=NextAnchor();
         const NativePixelFormat format;
         const unsigned width,height;
+        const unsigned dxgi;
         DeviceResources resources;
-        Job(std::shared_ptr<State> s,uint64_t f,uint64_t g,NativePixelFormat p,unsigned w,unsigned h):
-            owner(std::move(s)),frame(f),generation(g),format(p),width(w),height(h){}
+        Job(std::shared_ptr<State> s,uint64_t f,uint64_t g,NativePixelFormat p,unsigned w,unsigned h,unsigned d):
+            owner(std::move(s)),frame(f),generation(g),format(p),width(w),height(h),dxgi(d){}
         ~Job(){owner->inflight.fetch_sub(1);}
         HRESULT STDMETHODCALLTYPE QueryInterface(REFIID id,void** out) override {
             if(!out)return E_POINTER;
@@ -114,65 +103,34 @@ class NativeHipLive {
             auto& j=*static_cast<Job*>(p);
             try{return j.Process(queue);}catch(...){Log("callback_failure",j.frame,"device must be lost; suffix not safe");return -1;}
         }
+        // V3 GPU-resident callback: no CPU readback. The prefix already copied
+        // color->in_buf and in_buf->out_buf (out_buf is the original-frame
+        // fallback), so on ANY rejection/failure the suffix writes back the
+        // original pixels exactly like the old CPU fallback path.
         int Process(uint64_t queue){
             if(called.exchange(true)){Log("duplicate_callback",frame,"resubmitted command list rejected");return -1;}
             uint64_t expected=0;
             if(!queue||(!owner->queue.compare_exchange_strong(expected,queue)&&expected!=queue)){
-                Log("queue_conflict",frame,"callback rejected before readback");return -1;
+                Log("queue_conflict",frame,"callback rejected before GPU frame");return -1;
             }
             std::unique_lock<std::mutex> serial(owner->processing,std::try_to_lock);
             if(!serial.owns_lock())return -1;
             if(FAILED(resources.device->GetDeviceRemovedReason()))return -1;
-            void* input=nullptr;D3D12_RANGE read{SIZE_T(resources.fp.Offset),SIZE_T(resources.bytes)};
-            if(FAILED(resources.readback->Map(0,&read,&input))||!input)return -1;
-            struct Unmap {ID3D12Resource* p;~Unmap(){D3D12_RANGE none{};p->Unmap(0,&none);}} unmap{resources.readback.p};
-            const size_t row=size_t(width)*NativePixelBytes(format);
-            for(unsigned y=0;y<height;y++)std::memcpy(resources.mapped+resources.fp.Offset+size_t(y)*resources.fp.Footprint.RowPitch,
-                static_cast<const unsigned char*>(input)+resources.fp.Offset+size_t(y)*resources.fp.Footprint.RowPitch,row);
-            // Upload is now a complete original-frame fallback before ANY
-            // allocation/conversion/HIP work that might fail. Never reuse output.
+            if(!owner->client||!owner->client->HasRawGpu()){
+                Log("processed",frame,"V3 raw bridge missing; original input");return 0;
+            }
             auto bypass=[&]{return (generation&1)||owner->disabled.load()||owner->generation.load()!=generation;};
             if(bypass()){Log("processed",frame,"F6 bypass; original input");return 0;}
             try {
-                std::vector<unsigned char> packed(row*height);
-                for(unsigned y=0;y<height;y++)std::memcpy(packed.data()+size_t(y)*row,
-                    static_cast<const unsigned char*>(input)+resources.fp.Offset+size_t(y)*resources.fp.Footprint.RowPitch,row);
-                std::vector<float> rgba;
-                if(!NativePixelsToRgbaF32(packed.data(),format,width,height,rgba)){
-                    Log("processed",frame,"input rejected; original input");return 0;
-                }
-                std::vector<float> net_rgba(size_t(NativeHipNetWidth)*NativeHipNetHeight*4);
-                std::vector<float> net_rgb(size_t(NativeHipNetWidth)*NativeHipNetHeight*3);
-                NativeResizeChannels(rgba.data(),width,height,net_rgba.data(),NativeHipNetWidth,NativeHipNetHeight,4);
-                if(bypass()){Log("processed",frame,"F6 bypass; original input");return 0;}
-                if(owner->client->RunFrame(net_rgba.data(),net_rgb.data(),unsigned(frame),owner->display_srgb)){
+                if(owner->client->RunFrameRaw(owner->in_handle,owner->out_handle,width,height,dxgi,
+                                             unsigned(frame),owner->display_srgb,owner->buf_gen)){
+                    // out_buf still holds the prefix in->out copy (original pixels).
                     Log("processed",frame,"HIP failed; original input");return 0;
                 }
-                std::vector<float> rgb(size_t(width)*height*3);
-                NativeResizeChannels(net_rgb.data(),NativeHipNetWidth,NativeHipNetHeight,rgb.data(),width,height,3);
-                if(!NativeRgbF32ToPixels(rgb.data(),packed.data(),format,width,height)){
-                    Log("processed",frame,"output rejected; original input");return 0;
-                }
-                if(bypass()){Log("processed",frame,"F6 changed since Record; original input");return 0;}
-                size_t changed=0;const size_t bpp=NativePixelBytes(format),rgbbytes=bpp/4*3;
-                for(unsigned y=0;y<height;y++){
-                    auto* dst=resources.mapped+resources.fp.Offset+size_t(y)*resources.fp.Footprint.RowPitch;
-                    auto* src=packed.data()+size_t(y)*row;
-                    // UPLOAD can be write-combined VRAM. CPU reads from it
-                    // serialize PCIe transactions; compare cached READBACK instead.
-                    const auto* original=static_cast<const unsigned char*>(input)+resources.fp.Offset+size_t(y)*resources.fp.Footprint.RowPitch;
-                    for(size_t x=0;x<row;x+=bpp)for(size_t c=0;c<rgbbytes;c++)changed+=original[x+c]!=src[x+c];
-                    std::memcpy(dst,src,row);
-                }
-                // If a recording thread toggled during upload encoding, roll
-                // back from this job's completed readback, including exact alpha.
-                if(bypass()){
-                    for(unsigned y=0;y<height;y++)std::memcpy(resources.mapped+resources.fp.Offset+size_t(y)*resources.fp.Footprint.RowPitch,
-                        static_cast<const unsigned char*>(input)+resources.fp.Offset+size_t(y)*resources.fp.Footprint.RowPitch,row);
-                    Log("processed",frame,"F6 changed during encoding; original input");return 0;
-                }
-                Log("processed",frame,"live HIP network; reset=1 (not temporal)",changed);return 0;
-            }catch(...){Log("processed",frame,"HIP/conversion exception; original input");return 0;}
+                if(bypass())Log("processed",frame,"F6 changed during GPU frame; new pixels kept, bypasses next frame");
+                else Log("processed",frame,"live HIP network GPU-resident; reset=1 (not temporal)");
+                return 0;
+            }catch(...){Log("processed",frame,"HIP exception; original input");return 0;}
         }
     };
     static bool ValidState(D3D12_RESOURCE_STATES s){
@@ -185,19 +143,101 @@ class NativeHipLive {
         default:return false;
         }
     }
-    static void Copy(ID3D12GraphicsCommandList* list,Job& job,D3D12_RESOURCE_STATES state,bool suffix){
-        auto& r=job.resources;
-        D3D12_RESOURCE_STATES transfer=suffix?D3D12_RESOURCE_STATE_COPY_DEST:D3D12_RESOURCE_STATE_COPY_SOURCE;
+    static D3D12_TEXTURE_COPY_LOCATION BufLoc(ID3D12Resource* buf,const D3D12_RESOURCE_DESC& desc,size_t bpp){
+        D3D12_TEXTURE_COPY_LOCATION l{};
+        l.pResource=buf;l.Type=D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+        l.PlacedFootprint.Offset=0;
+        l.PlacedFootprint.Footprint.Width=desc.Width;
+        l.PlacedFootprint.Footprint.Height=desc.Height;
+        l.PlacedFootprint.Footprint.Depth=1;
+        l.PlacedFootprint.Footprint.Format=desc.Format;
+        l.PlacedFootprint.Footprint.RowPitch=desc.Width*(UINT)bpp;
+        return l;
+    }
+    static D3D12_RESOURCE_BARRIER Bar(ID3D12Resource* r,int from,int to){
         D3D12_RESOURCE_BARRIER b{};b.Type=D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
-        b.Transition={r.color.p,0,state,transfer};
-        if(state!=transfer)list->ResourceBarrier(1,&b);
-        D3D12_TEXTURE_COPY_LOCATION texture{},buffer{};
-        texture.pResource=r.color.p;texture.Type=D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
-        buffer.pResource=suffix?r.upload.p:r.readback.p;buffer.Type=D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
-        buffer.PlacedFootprint=r.fp;
-        list->CopyTextureRegion(suffix?&texture:&buffer,0,0,0,suffix?&buffer:&texture,nullptr);
-        std::swap(b.Transition.StateBefore,b.Transition.StateAfter);
-        if(state!=transfer)list->ResourceBarrier(1,&b);
+        b.Transition={r,0,static_cast<D3D12_RESOURCE_STATES>(from),static_cast<D3D12_RESOURCE_STATES>(to)};
+        return b;
+    }
+    // Implicit-barrier state (Windows 11 SDK); missing from mingw-w64 headers
+    // and outside the enum's constant range, so it travels as a plain int.
+    static constexpr int StateUnknown=0x80000000;
+    // V3: one DEFAULT-heap in/out buffer pair per (device, geometry, format), with
+    // Win32 shared handles the .so imports into HIP. Recreated on any change.
+    static bool EnsureBuffers(State& s,ID3D12Device* d,const D3D12_RESOURCE_DESC& desc,size_t bpp){
+        const unsigned w=unsigned(desc.Width),h=desc.Height,dxgi=unsigned(desc.Format);
+        if(s.in_buf.p&&s.buf_w==w&&s.buf_h==h&&s.buf_dxgi==dxgi)return true;
+        // BufLoc assumes a packed footprint (RowPitch == width*bpp). Reject any
+        // row-padded layout before we allocate. Same check as the old Create().
+        {
+            D3D12_PLACED_SUBRESOURCE_FOOTPRINT fp{};UINT rows=0;UINT64 rowbytes=0,total=0;
+            d->GetCopyableFootprints(&desc,0,1,0,&fp,&rows,&rowbytes,&total);
+            const UINT64 packed=UINT64(w)*bpp;
+            if(rows!=h||rowbytes!=packed||fp.Footprint.Width!=desc.Width||
+               fp.Footprint.Height!=h||fp.Footprint.Depth!=1||fp.Footprint.Format!=desc.Format||
+               fp.Footprint.RowPitch<packed||!total||
+               UINT64(h-1)*fp.Footprint.RowPitch+packed>total-fp.Offset)return false;
+        }
+        if(s.in_handle){CloseHandle(s.in_handle);s.in_handle=nullptr;}
+        if(s.out_handle){CloseHandle(s.out_handle);s.out_handle=nullptr;}
+        s.in_buf.Reset();s.out_buf.Reset();
+        D3D12_RESOURCE_DESC buffer{};buffer.Dimension=D3D12_RESOURCE_DIMENSION_BUFFER;
+        buffer.Width=UINT64(size_t(w)*h*bpp);buffer.Height=1;buffer.DepthOrArraySize=buffer.MipLevels=1;
+        buffer.SampleDesc.Count=1;buffer.Layout=D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+        D3D12_HEAP_PROPERTIES heap{};heap.CreationNodeMask=heap.VisibleNodeMask=1;
+        heap.Type=D3D12_HEAP_TYPE_DEFAULT;
+        if(FAILED(d->CreateCommittedResource(&heap,D3D12_HEAP_FLAG_NONE,&buffer,
+            D3D12_RESOURCE_STATE_COPY_DEST,nullptr,IID_PPV_ARGS(s.in_buf.Out())))||
+           FAILED(d->CreateCommittedResource(&heap,D3D12_HEAP_FLAG_NONE,&buffer,
+            D3D12_RESOURCE_STATE_COPY_DEST,nullptr,IID_PPV_ARGS(s.out_buf.Out()))))return false;
+        // R|W: HIP maps in_buf read-only and out_buf read-write.
+        const DWORD access=GENERIC_READ|GENERIC_WRITE;
+        if(FAILED(d->CreateSharedHandle(s.in_buf.p,nullptr,access,nullptr,&s.in_handle))||
+           FAILED(d->CreateSharedHandle(s.out_buf.p,nullptr,access,nullptr,&s.out_handle))){
+            if(s.in_handle){CloseHandle(s.in_handle);s.in_handle=nullptr;}
+            if(s.out_handle){CloseHandle(s.out_handle);s.out_handle=nullptr;}
+            s.in_buf.Reset();s.out_buf.Reset();return false;
+        }
+        s.buf_w=w;s.buf_h=h;s.buf_dxgi=dxgi;s.buf_bytes=size_t(w)*h*bpp;s.buf_gen++;
+        return true;
+    }
+    // Prefix: color -> in_buf, then in_buf -> out_buf. The second copy keeps
+    // out_buf an exact original-frame fallback until the .so overwrites its RGB.
+    // The color is transitioned from its KNOWN `state` and restored, matching
+    // the old Copy() semantics. Implicit (UNKNOWN) barriers on our own buffers:
+    // we don't track them between frames, and UNKNOWN is always safe.
+    static void CopyPrefix(ID3D12GraphicsCommandList* list,State& s,D3D12_RESOURCE_STATES state,
+                           ID3D12Resource* color,const D3D12_RESOURCE_DESC& desc,size_t bpp){
+        D3D12_RESOURCE_BARRIER b=Bar(color,state,D3D12_RESOURCE_STATE_COPY_SOURCE);
+        if(state!=D3D12_RESOURCE_STATE_COPY_SOURCE)list->ResourceBarrier(1,&b);
+        D3D12_TEXTURE_COPY_LOCATION texture{},inb=BufLoc(s.in_buf.p,desc,bpp);
+        texture.pResource=color;texture.Type=D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+        list->CopyTextureRegion(&inb,0,0,0,&texture,nullptr);
+        if(state!=D3D12_RESOURCE_STATE_COPY_SOURCE){
+            b=Bar(color,D3D12_RESOURCE_STATE_COPY_SOURCE,state);list->ResourceBarrier(1,&b);
+        }
+        D3D12_RESOURCE_BARRIER bs[2]={
+            Bar(s.in_buf.p,StateUnknown,D3D12_RESOURCE_STATE_COPY_SOURCE),
+            Bar(s.out_buf.p,StateUnknown,D3D12_RESOURCE_STATE_COPY_DEST)};
+        list->ResourceBarrier(2,bs);
+        list->CopyResource(s.out_buf.p,s.in_buf.p);
+        bs[0]=Bar(s.in_buf.p,D3D12_RESOURCE_STATE_COPY_SOURCE,StateUnknown);
+        bs[1]=Bar(s.out_buf.p,D3D12_RESOURCE_STATE_COPY_DEST,StateUnknown);
+        list->ResourceBarrier(2,bs);
+    }
+    // Suffix: out_buf -> color. Restores the color to its known `state`.
+    static void CopySuffix(ID3D12GraphicsCommandList* list,State& s,D3D12_RESOURCE_STATES state,
+                           ID3D12Resource* color,const D3D12_RESOURCE_DESC& desc,size_t bpp){
+        D3D12_RESOURCE_BARRIER bs[2]={
+            Bar(s.out_buf.p,StateUnknown,D3D12_RESOURCE_STATE_COPY_SOURCE),
+            Bar(color,state,D3D12_RESOURCE_STATE_COPY_DEST)};
+        list->ResourceBarrier(2,bs);
+        D3D12_TEXTURE_COPY_LOCATION texture{},outb=BufLoc(s.out_buf.p,desc,bpp);
+        texture.pResource=color;texture.Type=D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+        list->CopyTextureRegion(&texture,0,0,0,&outb,nullptr);
+        bs[0]=Bar(s.out_buf.p,D3D12_RESOURCE_STATE_COPY_SOURCE,StateUnknown);
+        bs[1]=Bar(color,D3D12_RESOURCE_STATE_COPY_DEST,state);
+        list->ResourceBarrier(2,bs);
     }
     static void Initialize(std::shared_ptr<State> s) noexcept {
         try {
@@ -267,11 +307,13 @@ public:
             if(s->init.load(std::memory_order_acquire)!=2)return false;
             if(s->inflight.fetch_add(1)>=MaxInflight){s->inflight.fetch_sub(1);return false;}
             Job* raw=nullptr;
-            try{raw=new Job(s,frame_id,generation,format,unsigned(desc.Width),desc.Height);}catch(...){s->inflight.fetch_sub(1);throw;}
+            try{raw=new Job(s,frame_id,generation,format,unsigned(desc.Width),desc.Height,unsigned(desc.Format));}catch(...){s->inflight.fetch_sub(1);throw;}
             struct Caller {Job* p;~Caller(){p->Release();}} caller{raw};
-            if(!raw->resources.Create(device.p,color,desc,NativePixelBytes(format))){Log("setup_failed",frame_id,"original unchanged");return false;}
+            raw->resources.Bind(device.p,color);
+            const size_t bpp=NativePixelBytes(format);
+            if(!EnsureBuffers(*s,device.p,desc,bpp)){Log("setup_failed",frame_id,"buffer create/shared handle failed; original unchanged");return false;}
             if(FAILED(list->SetPrivateDataInterface(raw->anchor,raw))){Log("anchor_failed",frame_id);return false;}
-            Copy(list,*raw,state,false);
+            CopyPrefix(list,*s,state,color,desc,bpp);
             uint32_t accepted=0;
             Dlss5SubmitMarker marker{DLSS5_SUBMIT_MAGIC,DLSS5_SUBMIT_VERSION,sizeof(Dlss5SubmitMarker),raw,
                 &Job::Retain,&Job::ReleaseContext,&Job::Run,&accepted};
@@ -280,7 +322,7 @@ public:
                 if(!s->disabled.exchange(true))Log("disabled",frame_id,"missing vkd3d HIP submit extension; no suffix writeback");
                 return false;
             }
-            Copy(list,*raw,state,true);
+            CopySuffix(list,*s,state,color,desc,bpp);
             // Extension now owns the job through allocator GPU completion/reset.
             // Failure to remove the conservative anchor is safe, not premature release.
             list->SetPrivateDataInterface(raw->anchor,nullptr);

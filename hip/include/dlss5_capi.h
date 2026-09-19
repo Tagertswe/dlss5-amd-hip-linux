@@ -72,6 +72,9 @@ typedef struct Dlss5FrameRaw {
     dlss5_u32 seed;
     dlss5_u32 flags;
     float paper_white, transfer, color;
+    /* Import-cache generation: bump whenever the handles are recreated (kernel
+       object handle values can be reused; the cache must not alias them). */
+    dlss5_u32 handle_gen;
 } Dlss5FrameRaw;
 typedef struct Dlss5HipFrameBridge {
     unsigned long long magic;
