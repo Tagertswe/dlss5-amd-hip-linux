@@ -60,6 +60,12 @@ class NativeHipLive {
         HANDLE in_handle{},out_handle{};
         void* in_host{},* out_host{};
         bool shared_mode{};
+        // Tracked D3D12 state of the persistent buffers (both are created in
+        // COPY_DEST). This vkd3d build has NO implicit-barrier support: every
+        // transition must use valid explicit states, and an unknown state
+        // invalidates the command list and trips the device-removed guard.
+        D3D12_RESOURCE_STATES in_state=D3D12_RESOURCE_STATE_COPY_DEST;
+        D3D12_RESOURCE_STATES out_state=D3D12_RESOURCE_STATE_COPY_DEST;
         unsigned buf_w{},buf_h{},buf_dxgi{};
         size_t buf_bytes{};
         uint32_t buf_gen{0};
@@ -184,14 +190,14 @@ class NativeHipLive {
         l.PlacedFootprint.Footprint.RowPitch=desc.Width*(UINT)bpp;
         return l;
     }
-    static D3D12_RESOURCE_BARRIER Bar(ID3D12Resource* r,int from,int to){
+    // Explicit transition barrier. This vkd3d build has NO implicit-barrier
+    // support: only valid D3D12 states are accepted, an unknown state invalidates
+    // the command list (and then the submit extension trips device-removed).
+    static D3D12_RESOURCE_BARRIER Bar(ID3D12Resource* r,D3D12_RESOURCE_STATES from,D3D12_RESOURCE_STATES to){
         D3D12_RESOURCE_BARRIER b{};b.Type=D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
-        b.Transition={r,0,static_cast<D3D12_RESOURCE_STATES>(from),static_cast<D3D12_RESOURCE_STATES>(to)};
+        b.Transition={r,0,from,to};
         return b;
     }
-    // Implicit-barrier state (Windows 11 SDK); missing from mingw-w64 headers
-    // and outside the enum's constant range, so it travels as a plain int.
-    static constexpr int StateUnknown=0x80000000;
     static void ReleaseBuffers(State& s){
         if(s.in_buf.p&&s.in_host){s.in_buf.p->Unmap(0,nullptr);s.in_host=nullptr;}
         if(s.out_buf.p&&s.out_host){s.out_buf.p->Unmap(0,nullptr);s.out_host=nullptr;}
@@ -276,46 +282,56 @@ class NativeHipLive {
         const char* err=TrySharedBuffers(s,d,desc,bpp);
         if(err)err=TryMappedBuffers(s,d,desc,bpp);
         if(err)return err;
+        s.in_state=s.out_state=D3D12_RESOURCE_STATE_COPY_DEST;
         s.buf_w=w;s.buf_h=h;s.buf_dxgi=dxgi;s.buf_bytes=size_t(w)*h*bpp;s.buf_gen++;
         return nullptr;
     }
     // Prefix: color -> in_buf, then in_buf -> out_buf. The second copy keeps
     // out_buf an exact original-frame fallback until the .so overwrites its RGB.
     // The color is transitioned from its KNOWN `state` and restored, matching
-    // the old Copy() semantics. Implicit (UNKNOWN) barriers on our own buffers:
-    // we don't track them between frames, and UNKNOWN is always safe.
+    // the old Copy() semantics. Our own buffers use explicit tracked states
+    // (s.in_state/s.out_state) — no implicit barriers on this vkd3d build.
     static void CopyPrefix(ID3D12GraphicsCommandList* list,State& s,D3D12_RESOURCE_STATES state,
                            ID3D12Resource* color,const D3D12_RESOURCE_DESC& desc,size_t bpp){
         D3D12_RESOURCE_BARRIER b=Bar(color,state,D3D12_RESOURCE_STATE_COPY_SOURCE);
         if(state!=D3D12_RESOURCE_STATE_COPY_SOURCE)list->ResourceBarrier(1,&b);
+        if(s.in_state!=D3D12_RESOURCE_STATE_COPY_DEST){
+            b=Bar(s.in_buf.p,s.in_state,D3D12_RESOURCE_STATE_COPY_DEST);list->ResourceBarrier(1,&b);
+            s.in_state=D3D12_RESOURCE_STATE_COPY_DEST;
+        }
         D3D12_TEXTURE_COPY_LOCATION texture{},inb=BufLoc(s.in_buf.p,desc,bpp);
         texture.pResource=color;texture.Type=D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
         list->CopyTextureRegion(&inb,0,0,0,&texture,nullptr);
         if(state!=D3D12_RESOURCE_STATE_COPY_SOURCE){
             b=Bar(color,D3D12_RESOURCE_STATE_COPY_SOURCE,state);list->ResourceBarrier(1,&b);
         }
-        D3D12_RESOURCE_BARRIER bs[2]={
-            Bar(s.in_buf.p,StateUnknown,D3D12_RESOURCE_STATE_COPY_SOURCE),
-            Bar(s.out_buf.p,StateUnknown,D3D12_RESOURCE_STATE_COPY_DEST)};
-        list->ResourceBarrier(2,bs);
+        if(s.in_state!=D3D12_RESOURCE_STATE_COPY_SOURCE){
+            b=Bar(s.in_buf.p,s.in_state,D3D12_RESOURCE_STATE_COPY_SOURCE);list->ResourceBarrier(1,&b);
+            s.in_state=D3D12_RESOURCE_STATE_COPY_SOURCE;
+        }
+        if(s.out_state!=D3D12_RESOURCE_STATE_COPY_DEST){
+            b=Bar(s.out_buf.p,s.out_state,D3D12_RESOURCE_STATE_COPY_DEST);list->ResourceBarrier(1,&b);
+            s.out_state=D3D12_RESOURCE_STATE_COPY_DEST;
+        }
         list->CopyResource(s.out_buf.p,s.in_buf.p);
-        bs[0]=Bar(s.in_buf.p,D3D12_RESOURCE_STATE_COPY_SOURCE,StateUnknown);
-        bs[1]=Bar(s.out_buf.p,D3D12_RESOURCE_STATE_COPY_DEST,StateUnknown);
-        list->ResourceBarrier(2,bs);
     }
     // Suffix: out_buf -> color. Restores the color to its known `state`.
     static void CopySuffix(ID3D12GraphicsCommandList* list,State& s,D3D12_RESOURCE_STATES state,
                            ID3D12Resource* color,const D3D12_RESOURCE_DESC& desc,size_t bpp){
-        D3D12_RESOURCE_BARRIER bs[2]={
-            Bar(s.out_buf.p,StateUnknown,D3D12_RESOURCE_STATE_COPY_SOURCE),
-            Bar(color,state,D3D12_RESOURCE_STATE_COPY_DEST)};
-        list->ResourceBarrier(2,bs);
+        D3D12_RESOURCE_BARRIER b=Bar(s.out_buf.p,s.out_state,D3D12_RESOURCE_STATE_COPY_SOURCE);
+        if(s.out_state!=D3D12_RESOURCE_STATE_COPY_SOURCE)list->ResourceBarrier(1,&b);
+        s.out_state=D3D12_RESOURCE_STATE_COPY_SOURCE;
+        b=Bar(color,state,D3D12_RESOURCE_STATE_COPY_DEST);
+        if(state!=D3D12_RESOURCE_STATE_COPY_DEST)list->ResourceBarrier(1,&b);
         D3D12_TEXTURE_COPY_LOCATION texture{},outb=BufLoc(s.out_buf.p,desc,bpp);
         texture.pResource=color;texture.Type=D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
         list->CopyTextureRegion(&texture,0,0,0,&outb,nullptr);
-        bs[0]=Bar(s.out_buf.p,D3D12_RESOURCE_STATE_COPY_SOURCE,StateUnknown);
-        bs[1]=Bar(color,D3D12_RESOURCE_STATE_COPY_DEST,state);
-        list->ResourceBarrier(2,bs);
+        if(state!=D3D12_RESOURCE_STATE_COPY_DEST){
+            b=Bar(color,D3D12_RESOURCE_STATE_COPY_DEST,state);list->ResourceBarrier(1,&b);
+        }
+        b=Bar(s.out_buf.p,s.out_state,D3D12_RESOURCE_STATE_COPY_DEST);
+        if(s.out_state!=D3D12_RESOURCE_STATE_COPY_DEST)list->ResourceBarrier(1,&b);
+        s.out_state=D3D12_RESOURCE_STATE_COPY_DEST;
     }
     static void Initialize(std::shared_ptr<State> s) noexcept {
         try {
