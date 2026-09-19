@@ -141,13 +141,15 @@ __global__ void k_ffn_f32(const float* input, const u8* weights, const float* sc
     const uint wave = threadIdx.x / 32;
     const uint group = wave / WAVES_PER_GROUP;
     const uint sub = wave % WAVES_PER_GROUP;
-    // Single LDS buffer: the input staging (16*GROUPS*C bytes) aliases the start
-    // of the hidden buffer (16*GROUPS*hidden_c bytes). The input is only read
-    // during the expand MMA loop and hidden is only written after it, so one
-    // barrier makes the aliasing safe. C32 uses GROUPS=2 to halve CTA/weight
-    // traffic while keeping 64 waves/CU.
+    // C32 stages its E4M3 input (16*GROUPS*C bytes) in a SEPARATE buffer so the
+    // hidden write cannot clobber it, removing one __syncthreads. C!=32 keeps
+    // the original alias: the input staging (16*GROUPS*C bytes) aliases the start
+    // of the hidden buffer (16*GROUPS*hidden_c bytes) and one barrier makes the
+    // aliasing safe. C32 uses GROUPS=2 to halve CTA/weight traffic while keeping
+    // 64 waves/CU.
     __shared__ u8 hidden[16 * GROUPS * hidden_c];
-    u8* in = hidden;
+    __shared__ u8 inbuf[C == 32 ? 16 * GROUPS * 32u : 1u];
+    u8* in = (C == 32) ? inbuf : hidden;
     if constexpr (C == 32) {
         // 4-byte input staging for C32: same E4M3 bytes, fewer LDS stores.
         const uint count4 = 16 * GROUPS * 8;
@@ -209,9 +211,11 @@ __global__ void k_ffn_f32(const float* input, const u8* weights, const float* sc
                     dbg_ex[(first + t0 + c2.x) * hidden_c + (sub * 4 + n) * 16 + c2.y] = ex[n].Get(i);
                 }
     }
-    // The hidden buffer aliases the input staging; every group must finish
-    // reading its input tile before any group overwrites it with hidden bytes.
-    __syncthreads();
+    // For C!=32 the hidden buffer aliases the input staging; every group must
+    // finish reading its input tile before any group overwrites it with hidden
+    // bytes. C32 stages input separately, so this barrier is not needed (the
+    // hidden write below reads only each wave's own accumulators).
+    if constexpr (C != 32) __syncthreads();
     if (group < GROUPS) {
         const uint t0 = group * 16;
         for (uint n = 0; n < 4; ++n)
