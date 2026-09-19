@@ -86,6 +86,7 @@ class TerminalUiTests(unittest.TestCase):
             self.assertEqual(tui.columns, 140)
             sys.stdout.write('line one\n')
             sys.stdout.write('line two\n')
+            sys.stdout.write('progress 10\rprogress 90\n')
             os.write(master, b'y\n')
             self.assertEqual(input('choice [y/N] '), 'y')
             sys.stdout.write('final\n')

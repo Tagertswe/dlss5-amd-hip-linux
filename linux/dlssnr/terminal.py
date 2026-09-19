@@ -192,9 +192,13 @@ class _Shell:
         if not tui.enabled:
             return tui._real_stdout.write(text)
         tui._pending += text
-        while '\n' in tui._pending:
-            line, tui._pending = tui._pending.split('\n', 1)
-            tui._commit(line)
+        while True:
+            cuts = [tui._pending.index(char) + 1 for char in '\n\r' if char in tui._pending]
+            if not cuts:
+                break
+            cut = min(cuts)
+            tui._commit(tui._pending[:cut])
+            tui._pending = tui._pending[cut:]
         tui._render()
         return len(text)
 
