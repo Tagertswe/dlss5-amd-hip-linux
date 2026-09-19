@@ -6,7 +6,7 @@ A native Linux HIP/rocWMMA implementation of the complete 71-block DLSS5 network
 
 ## Download and install
 
-**[Download v0.2.3 .tar.gz](https://github.com/guentra/dlss5-amd-hip-linux/releases/download/v0.2.3/dlss5-amd-hip-linux.tar.gz)** · [SHA256](https://github.com/guentra/dlss5-amd-hip-linux/releases/download/v0.2.3/dlss5-amd-hip-linux.tar.gz.sha256) · [Dev build (dlss5-base)](https://github.com/guentra/dlss5-amd-hip-linux/raw/dlss5-base/dist/dlss5-amd-hip-linux.tar.gz) · [Release notes](https://github.com/guentra/dlss5-amd-hip-linux/releases/tag/v0.2.3)
+**[Download v0.2.3 .tar.gz](https://github.com/guentra/dlss5-amd-hip-linux/releases/download/v0.2.3/dlss5-amd-hip-linux.tar.gz)** · [SHA256](https://github.com/guentra/dlss5-amd-hip-linux/releases/download/v0.2.3/dlss5-amd-hip-linux.tar.gz.sha256) · [Release notes](https://github.com/guentra/dlss5-amd-hip-linux/releases/tag/v0.2.3)
 
 1. Close the game. Extract the archive inside its directory, keeping the `dlss5-amd-hip-linux` subfolder.
 2. Put your legitimately obtained `nvngx_dlssnr.dll` **310.8.0.0** beside the game executable or in the game root (or select it in the wizard).
