@@ -66,7 +66,10 @@ __global__ void k_prefix(const float* input, const float* weights, const float* 
     __syncthreads();
     for (uint i = 0; i < 16; i++) {
         float v = otile[i * 32 + t];
-        output[first * 32 + i * 32 + t] = v;
+        // C32 block 0 consumes only the f16 sibling (in_h); the f32 window is dead, so
+        // skip its 283MB write when the f16 is produced. launch_prefix (no f16) keeps it.
+        if (!output_h)
+            output[first * 32 + i * 32 + t] = v;
         if (output_h)
             output_h[first * 32 + i * 32 + t] = __float2half_rn(v);
     }
