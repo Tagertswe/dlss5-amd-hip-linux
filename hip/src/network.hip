@@ -131,9 +131,12 @@ struct Block {
                        windowed?s.out16.as<__half>():nullptr,w,h,sw,sh,px,py,chain);
        return;
       }
-      if(c==32 && in_h && std::getenv("DLSS5_C32_FUSED") && std::string(std::getenv("DLSS5_C32_FUSED")) == "1"){
-       const bool write_ffn = std::getenv("DLSS5_C32_FFN_OUT") &&
-                              std::string(std::getenv("DLSS5_C32_FFN_OUT")) != "0";
+       // C32 fused FFN+QKV+attention+projection is the default: byte-exact vs the
+       // split path (test_raw_pipeline) and ~5ms faster on gfx1201. DLSS5_C32_SPLIT=1
+       // forces the legacy split FFN for debugging.
+       if(c==32 && in_h && !(std::getenv("DLSS5_C32_SPLIT") && std::string(std::getenv("DLSS5_C32_SPLIT")) == "1")){
+        const bool write_ffn = std::getenv("DLSS5_C32_FFN_OUT") &&
+                               std::string(std::getenv("DLSS5_C32_FFN_OUT")) != "0";
         launch_c32_fused(in_h, ffn_rw.as<u8>(), fs.as<float>(), qw_rw.as<u8>(), qs.as<float>(),
                          bias.as<float>(), p1_rw.as<u8>(), s1.as<float>(),
                         write_ffn ? s.bh.as<__half>() : nullptr, s.ah.as<__half>(),
