@@ -1,6 +1,7 @@
 """CPU-only independent contract tests; never import upstream executables."""
 import importlib.util
 import math
+import os
 from pathlib import Path
 import struct
 import unittest
@@ -298,8 +299,8 @@ class ExperimentalTests(unittest.TestCase):
             p=Path(folder);(p/'manifest.json').write_text(json.dumps({'schema':c.CACHE_VERSION,'runtime_ready':False}))
             with self.assertRaises(RuntimeError):c.validate_cache(p,layout_mode='amd-consumer-derived')
             with self.assertRaises(ValueError):c.validate_cache(p,audit_only=True,layout_mode='amd-consumer-derived')
-        dll=Path('/home/guentra/nr-rocm/nvngx_dlssnr.dll')
-        if dll.is_file():
+        dll=Path(os.environ['DLSS5_NVIDIA_DLL']).expanduser() if os.environ.get('DLSS5_NVIDIA_DLL') else None
+        if dll is not None and dll.is_file():
             with self.assertRaisesRegex(RuntimeError,'unresolved'):c.convert_nvidia_dll(dll)
             with self.assertRaises(ValueError):c.convert_nvidia_dll(dll,audit_only=True,layout_mode='amd-consumer-derived')
 

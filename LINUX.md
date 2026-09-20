@@ -18,8 +18,9 @@ vkd3d-proton often cannot; if the log stays on FSR, that is the current limit.
 
 A native HIP rewrite lives in [`hip/`](hip/) (rocWMMA on `gfx1201`).
 The complete 71-block network, codecs and host-motion API run offline.
-See [`hip/README.md`](hip/README.md) for builds, tests and image inference.
-The complete weight cache explicitly marks reconstructed layouts; it is not a
+See [`docs/BUILD.md`](docs/BUILD.md) for builds and toolchain overrides, and
+[`hip/README.md`](hip/README.md) for tests and image inference. The complete
+weight cache explicitly marks reconstructed layouts; it is not a
 NVIDIA-equivalence result.
 
 **Proton boundary:** the ReShade readback/writeback path retains synchronous

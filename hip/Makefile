@@ -1,15 +1,69 @@
-HIPCC ?= /opt/rocm/bin/hipcc
+# Override any of: HIPCC, ROCM_PATH, HIP_PATH, ARCH, MINGW_CC, MINGW_PREFIX, TOOLCHAIN_DIR.
 ARCH ?= gfx1201
-INCLUDES := -Iinclude -I/opt/rocm/include
-LDFLAGS := -L/opt/rocm/lib -lamdhip64 -Wl,-rpath,/opt/rocm/lib
-CXXFLAGS := -O3 -std=c++17 --offload-arch=$(ARCH) $(INCLUDES)
 BUILD ?= build
+
+# Prefer an explicit ROCm prefix over `hipcc` on PATH: pip/venv `rocm-sdk-core`
+# wrappers often shadow the device compiler. GNU make treats `)` as the end of
+# $(shell ...), so discovery stays in make functions / simple commands.
+ifeq ($(origin ROCM_PATH), undefined)
+  ifneq ($(HIP_PATH),)
+    ROCM_PATH := $(HIP_PATH)
+  else
+    ROCM_PATH := $(firstword \
+      $(if $(wildcard /opt/rocm/bin/hipcc),/opt/rocm) \
+      $(patsubst %/bin/hipcc,%,$(wildcard /opt/rocm-[0-9]*/bin/hipcc)))
+  endif
+endif
+ifeq ($(ROCM_PATH),)
+  ROCM_PATH := $(shell hipconfig --rocmpath 2>/dev/null)
+  ifneq ($(findstring site-packages,$(ROCM_PATH)),)
+    ROCM_PATH :=
+  endif
+  ifneq ($(findstring rocm_sdk,$(ROCM_PATH)),)
+    ROCM_PATH :=
+  endif
+endif
+ifeq ($(ROCM_PATH),)
+  _HIPCC_ON_PATH := $(shell command -v hipcc 2>/dev/null)
+  ifeq ($(findstring site-packages,$(_HIPCC_ON_PATH))$(findstring rocm_sdk,$(_HIPCC_ON_PATH)),)
+    ifneq ($(_HIPCC_ON_PATH),)
+      ROCM_PATH := $(abspath $(dir $(_HIPCC_ON_PATH))/..)
+    endif
+  endif
+endif
+
+ifeq ($(origin HIPCC), undefined)
+  ifneq ($(wildcard $(ROCM_PATH)/bin/hipcc),)
+    HIPCC := $(ROCM_PATH)/bin/hipcc
+  else
+    HIPCC := $(shell command -v hipcc 2>/dev/null)
+  endif
+endif
+
+INCLUDES := -Iinclude
+LDFLAGS := -lamdhip64
+ifneq ($(ROCM_PATH),)
+  INCLUDES += -I$(ROCM_PATH)/include
+  LDFLAGS := -L$(ROCM_PATH)/lib -lamdhip64 -Wl,-rpath,$(ROCM_PATH)/lib
+endif
+CXXFLAGS := -O3 -std=c++17 --offload-arch=$(ARCH) $(INCLUDES)
 TESTS := test_wmma test_stages test_quantize test_attention test_residual test_linear test_logical_ops test_ffn_f32
 
-MINGW_CC ?= $(firstword $(wildcard \
-  /home/guentra/dlssnr-linux-hip/toolchain/llvm-mingw/bin/x86_64-w64-mingw32-gcc \
-  /home/guentra/dlssnr-linux-hip/toolchain/llvm-mingw-20260826-ucrt-ubuntu-22.04-x86_64/bin/x86_64-w64-mingw32-gcc \
-  $(shell command -v x86_64-w64-mingw32-gcc 2>/dev/null)))
+ifeq ($(origin MINGW_CC), undefined)
+  ifneq ($(MINGW_PREFIX),)
+    MINGW_CC := $(MINGW_PREFIX)/bin/x86_64-w64-mingw32-gcc
+  else
+    MINGW_CC := $(shell command -v x86_64-w64-mingw32-gcc 2>/dev/null)
+  endif
+endif
+ifeq ($(MINGW_CC),)
+  MINGW_CC := $(firstword $(wildcard \
+    $(if $(TOOLCHAIN_DIR),$(TOOLCHAIN_DIR)/bin/x86_64-w64-mingw32-gcc \
+                          $(TOOLCHAIN_DIR)/llvm-mingw*/bin/x86_64-w64-mingw32-gcc) \
+    $(CURDIR)/../toolchain/llvm-mingw*/bin/x86_64-w64-mingw32-gcc))
+endif
+
+export HIPCC ROCM_PATH ARCH
 
 .PHONY: all clean test game test-api bench-ffn32
 
@@ -63,6 +117,7 @@ libdlss5_hip.so: $(BUILD)/capi.o $(BUILD)/frame.o $(BUILD)/kernels.o $(BUILD)/ke
 	$(HIPCC) $(CXXFLAGS) -shared -fPIC $^ $(LDFLAGS) -o $@
 
 dlss5_hip.dll: src/trampoline.c include/dlss5_capi.h
+	@test -n "$(MINGW_CC)" || { printf '%s\n' 'x86_64-w64-mingw32-gcc not found. Set MINGW_CC= or MINGW_PREFIX= or install mingw-w64.'; exit 2; }
 	$(MINGW_CC) -shared -O2 -o $@ src/trampoline.c
 
 test: $(TESTS)
@@ -85,7 +140,7 @@ test-frame: $(BUILD)/frame.o
 	$(BUILD)/test_temporal
 
 test-graph:
-	bash tests/run_graph_tests.sh
+	HIPCC="$(HIPCC)" ROCM_PATH="$(ROCM_PATH)" ARCH="$(ARCH)" bash tests/run_graph_tests.sh
 
 .PHONY: check test-python test-model
 # Run the GPU families serially even when the build uses -j.

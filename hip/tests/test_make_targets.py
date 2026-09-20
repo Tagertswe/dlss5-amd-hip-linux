@@ -7,10 +7,27 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 class VerificationTargets(unittest.TestCase):
-    def dry_run(self, target, *variables):
-        result = subprocess.run(
-            ['make', '--no-print-directory', '-n', '-C', str(ROOT), target, *variables],
-            capture_output=True, text=True, timeout=30)
+    def test_makefile_does_not_hardcode_a_user_home(self):
+        text = (ROOT / 'Makefile').read_text()
+        self.assertNotRegex(text, r'/home/\w+')
+        self.assertNotRegex(text, r'(?m)^HIPCC \?= /opt/rocm/bin/hipcc\s*$')
+
+    def test_toolchain_overrides_are_honored(self):
+        output = self.dry_run(
+            'libdlss5_hip.so', 'HIPCC=/custom/hipcc', 'ROCM_PATH=/custom/rocm',
+            force=True)
+        self.assertIn('/custom/hipcc', output)
+        self.assertIn('-I/custom/rocm/include', output)
+        self.assertIn('-L/custom/rocm/lib', output)
+        dll = self.dry_run('dlss5_hip.dll', 'MINGW_CC=/custom/mingw-gcc', force=True)
+        self.assertIn('/custom/mingw-gcc', dll)
+
+    def dry_run(self, target, *variables, force=False):
+        argv = ['make', '--no-print-directory', '-n', '-C', str(ROOT)]
+        if force:
+            argv.append('-B')
+        argv += [target, *variables]
+        result = subprocess.run(argv, capture_output=True, text=True, timeout=30)
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         return result.stdout
 

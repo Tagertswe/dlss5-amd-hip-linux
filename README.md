@@ -49,7 +49,7 @@ Uninstall: `./install.sh uninstall --exe /path/to/Game.exe --yes`, then remove t
 
 ## Development and credits
 
-[HIP backend / offline inference](hip/README.md) · [Third-party notices](linux/THIRD-PARTY.md)
+[Build from source](docs/BUILD.md) · [HIP backend / offline inference](hip/README.md) · [Third-party notices](linux/THIRD-PARTY.md)
 
 Linux HIP implementation, bridge and packaging: **guentra and AI collaborators**. Third-party components and upstream references remain covered by [Third-party notices](linux/THIRD-PARTY.md).
 

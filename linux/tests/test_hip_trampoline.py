@@ -1,6 +1,8 @@
 """Compile the real trampoline into an ABI-aware CPU harness, never Wine."""
+import os
 import pathlib
 import re
+import shutil
 import subprocess
 import tempfile
 import unittest
@@ -8,13 +10,38 @@ import unittest
 ROOT = pathlib.Path(__file__).resolve().parents[2]
 
 
+def _tool(name):
+    if name == 'x86_64-w64-mingw32-gcc' and os.environ.get('MINGW_CC'):
+        path = pathlib.Path(os.environ['MINGW_CC']).expanduser()
+        if path.is_file():
+            return str(path)
+    directories = []
+    if os.environ.get('MINGW_PREFIX'):
+        directories.append(pathlib.Path(os.environ['MINGW_PREFIX']).expanduser() / 'bin')
+    if os.environ.get('TOOLCHAIN_DIR'):
+        toolchain = pathlib.Path(os.environ['TOOLCHAIN_DIR']).expanduser()
+        directories.append(toolchain / 'bin')
+        directories.extend(sorted(toolchain.glob('llvm-mingw*/bin')))
+    directories.extend(sorted((ROOT / 'toolchain').glob('llvm-mingw*/bin')))
+    for directory in directories:
+        candidate = directory / name
+        if candidate.is_file():
+            return str(candidate)
+    return shutil.which(name)
+
+
 class TrampolineTests(unittest.TestCase):
     def test_pe_build_exports_and_sysv_registers(self):
-        toolchain = pathlib.Path('/home/guentra/dlssnr-linux-hip/toolchain/llvm-mingw/bin')
+        tools = {name: _tool(name) for name in
+                 ('x86_64-w64-mingw32-gcc', 'llvm-readobj', 'llvm-objdump')}
+        missing = [name for name, path in tools.items() if not path]
+        if missing:
+            self.skipTest('missing ' + ', '.join(missing) +
+                          '; set MINGW_CC / MINGW_PREFIX / TOOLCHAIN_DIR or install mingw-w64 and llvm')
         with tempfile.TemporaryDirectory() as tmp:
             dll = pathlib.Path(tmp) / 'dlss5_hip.dll'
-            def command(*args):
-                result = subprocess.run([str(toolchain / args[0]), *map(str, args[1:])],
+            def command(tool, *args):
+                result = subprocess.run([tools[tool], *map(str, args)],
                                         text=True, capture_output=True)
                 self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
                 return result.stdout
@@ -31,8 +58,11 @@ class TrampolineTests(unittest.TestCase):
             self.assertIn(b'__wine_get_unix_env', dll.read_bytes())
             self.assertNotIn(b'dlss5_hip_bridge.addr', dll.read_bytes())
             disasm = command('llvm-objdump', '-d', '--disassemble-symbols=dlss5_run', dll)
-            for move in (r'movq\s+%rcx, %rdi', r'movq\s+%rdx, %rsi', r'movl\s+%r8d, %edx'):
-                self.assertRegex(disasm, move)
+            self.assertRegex(disasm, r'movq\s+%rcx, %rdi')
+            self.assertRegex(disasm, r'movq\s+%rdx, %rsi')
+            # llvm-mingw moves r8d straight into edx; gcc may spill then reload.
+            self.assertRegex(disasm, r'movl\s+%r8d,')
+            self.assertRegex(disasm, r'movl\s+\S+, %edx')
             # TLS diagnostics can change the allocated call-target register;
             # the argument ABI above, not a compiler's %rax choice, is fixed.
             self.assertRegex(disasm, r'callq\s+\*%r(?:[abcd]x|[89]|1[01])\b')

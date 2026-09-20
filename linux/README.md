@@ -34,7 +34,9 @@ to work around a missing hook or a freeze. This release does not support Magpie.
 
 ## Build from source
 
-From the repository root, using ROCm/rocWMMA and an x64 MinGW C++ toolchain:
+From the repository root. See [`../docs/BUILD.md`](../docs/BUILD.md) for HIP
+toolchain discovery, the vkd3d source archive, ReShade placement and packager
+layout.
 
 ```sh
 make -C hip -j3 game hip-network70
@@ -42,8 +44,7 @@ linux/install.sh build-addon
 python3 linux/build_release.py
 ```
 
-See `../docs/BUILD.md` for the corresponding vkd3d source archive and build
-dependencies. Artifacts are written to `dist/`. The archive has a per-file SHA256
+Artifacts are written to `dist/`. The archive has a per-file SHA256
 manifest, offline image CLI and benchmark; no weights or project tests are packaged.
 
 ## Removal and logs

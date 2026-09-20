@@ -12,14 +12,14 @@ DLL or fatbin is loaded.
 ## Build and verify
 
 From the repository root, with ROCm/HIP 7, rocWMMA headers and an x64 MinGW
-compiler available for the small PE bridge:
+compiler available for the small PE bridge. Toolchain discovery, overrides,
+vkd3d and the packager are in [`docs/BUILD.md`](../docs/BUILD.md).
 
 ```sh
 make -C hip -j3 game hip-network70
 ```
 
-The public snapshot excludes the local regression suites. See `docs/BUILD.md`
-for build details and executable verification commands. Passing offline inference
+`make -C hip check` runs the GPU graph/API suites. Passing offline inference
 does not establish gameplay or NVIDIA numerical/visual equivalence.
 
 ## Run an image
