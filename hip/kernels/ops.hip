@@ -40,18 +40,23 @@ __global__ void k_linear_f32(const float* input, const u8* input_f8, const u8* w
     for (uint g = 0; g < k / 32; ++g) {
         {
             const uint col = (threadIdx.x % 8u) * 4u;
-            const uint row = first + threadIdx.x / 8u;
-            if (F8IN) {
-                *reinterpret_cast<u32*>(tile + (threadIdx.x / 8u) * 32u + col) =
-                    row < m ? *reinterpret_cast<const u32*>(input_f8 + row * k + g * 32u + col)
-                            : 0u;
-            } else {
-                const float4 v = row < m
-                    ? *reinterpret_cast<const float4*>(input + row * k + g * 32u + col)
-                    : make_float4(0.f, 0.f, 0.f, 0.f);
-                *reinterpret_cast<u32*>(tile + (threadIdx.x / 8u) * 32u + col) =
-                    u32(e4m3_byte(v.x)) | u32(e4m3_byte(v.y)) << 8 |
-                    u32(e4m3_byte(v.z)) << 16 | u32(e4m3_byte(v.w)) << 24;
+            // 16 input rows; 128 threads -> 1 row/thread-group, 64 threads -> 2. The n=32
+            // case only needs 2 active waves (col 0/16), so it launches with half the
+            // threads; the stride keeps the staged tile byte-identical at any size.
+            for (uint rlocal = threadIdx.x / 8u; rlocal < 16u; rlocal += blockDim.x / 8u) {
+                const uint row = first + rlocal;
+                if (F8IN) {
+                    *reinterpret_cast<u32*>(tile + rlocal * 32u + col) =
+                        row < m ? *reinterpret_cast<const u32*>(input_f8 + row * k + g * 32u + col)
+                                : 0u;
+                } else {
+                    const float4 v = row < m
+                        ? *reinterpret_cast<const float4*>(input + row * k + g * 32u + col)
+                        : make_float4(0.f, 0.f, 0.f, 0.f);
+                    *reinterpret_cast<u32*>(tile + rlocal * 32u + col) =
+                        u32(e4m3_byte(v.x)) | u32(e4m3_byte(v.y)) << 8 |
+                        u32(e4m3_byte(v.z)) << 16 | u32(e4m3_byte(v.w)) << 24;
+                }
             }
         }
         __syncthreads();
