@@ -128,7 +128,7 @@ __global__ void k_vit_attention(const float* qkv, const u8* qkv_f8, u8* out, uin
     // identity and the f8 -> f32 round trip before attention is redundant.
     {
         const uint col = (threadIdx.x % 8u) * 4u;
-        for (uint r = threadIdx.x / 8u; r < 16; r += 4) {
+        for (uint r = threadIdx.x / 8u; r < 16; r += blockDim.x / 8u) {
             if (F8IN) {
                 *reinterpret_cast<u32*>(qtile + r * 32u + col) =
                     *reinterpret_cast<const u32*>(qkv_f8 + (q0 + r) * stride + head * 32u + col);
@@ -148,7 +148,7 @@ __global__ void k_vit_attention(const float* qkv, const u8* qkv_f8, u8* out, uin
         for (uint half = 0; half < 2; ++half) {
             {
                 const uint col = (threadIdx.x % 8u) * 4u;
-                for (uint r = threadIdx.x / 8u; r < 16; r += 4) {
+                for (uint r = threadIdx.x / 8u; r < 16; r += blockDim.x / 8u) {
                     uint k = k0 + half * 16u + r;
                     if (F8IN) {
                         *reinterpret_cast<u32*>(ktile + r * 32u + col) =
@@ -192,7 +192,7 @@ __global__ void k_vit_attention(const float* qkv, const u8* qkv_f8, u8* out, uin
     for (uint k0 = 0; k0 < tokens; k0 += 32) {
         {
             const uint col = (threadIdx.x % 8u) * 4u;
-            for (uint r = threadIdx.x / 8u; r < 32; r += 4) {
+            for (uint r = threadIdx.x / 8u; r < 32; r += blockDim.x / 8u) {
                 uint k = k0 + r;
                 if (F8IN) {
                     *reinterpret_cast<u32*>(values + r * 32u + col) =
