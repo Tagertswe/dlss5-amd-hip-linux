@@ -22,7 +22,7 @@ __device__ inline uint window_pixel(uint window, uint token, uint width) {
 // (e4m3_byte is the identity on E4M3-grid values, so the separate re-quant pass
 // is numerically redundant) as 16B stores; phase 3 is pure MMAs.
 template <int C>
-__global__ void __launch_bounds__(128, 5) k_window_attention(const u8* qkv, const float* bias,
+__global__ void __launch_bounds__(128, 7) k_window_attention(const u8* qkv, const float* bias,
                                                              u8* output, uint width,
                                    uint height, uint packed, bool direct_f8 = false) {
     using namespace linalg;
@@ -35,7 +35,10 @@ __global__ void __launch_bounds__(128, 5) k_window_attention(const u8* qkv, cons
     const uint wave = threadIdx.x / 32u;
     const uint qtok = wave * 16u;
     __shared__ __half scores[64 * 68];
-    __shared__ u8 p8[64 * 64];
+    // p8 aliases the start of scores: total LDS drops 12800 -> 8704 B so the block
+    // fits 7 CTAs/CU instead of 5. Phase 2 quantizes into registers first, syncs, and
+    // only then writes p8 over the (no-longer-read) scores, so the aliasing is safe.
+    u8* p8 = reinterpret_cast<u8*>(scores);
     for (uint window = blockIdx.x; window < nwin; window += gridDim.x) {
 
     A8 q = A8::Load(qkv, (window * 64u + qtok) * uint(STRIDE) + head * 32u, uint(STRIDE));
@@ -52,6 +55,7 @@ __global__ void __launch_bounds__(128, 5) k_window_attention(const u8* qkv, cons
     }
     __syncthreads();
 
+    uint4 p8r[4];
     if (threadIdx.x < 64) {
         uint qi = threadIdx.x;
         float sum = 0.f;
@@ -66,16 +70,23 @@ __global__ void __launch_bounds__(128, 5) k_window_attention(const u8* qkv, cons
             sum += __half2float(__high2half(h[1]));
         }
         float inv = 1.f / fmaxf(sum, 1e-20f);
-        // 4 x 16B stores per row (16 E4M3 bytes): rows are 16B-aligned, banks
-        // 8-way instead of 32-way.
-        uint4* row = reinterpret_cast<uint4*>(p8 + qi * 64);
+        // Quantize into registers first: p8 aliases scores, so the LDS write is
+        // deferred past a barrier until every scores read above is complete.
+        // 4 x 16B (16 E4M3 bytes); rows 16B-aligned, banks 8-way instead of 32-way.
         for (int q4 = 0; q4 < 4; q4++) {
             uint4 v;
             u8* b = reinterpret_cast<u8*>(&v);
             for (int t = 0; t < 16; t++)
                 b[t] = e4m3_byte(__half2float(scores[qi * 68 + q4 * 16 + t]) * inv);
-            row[q4] = v;
+            p8r[q4] = v;
         }
+    }
+    __syncthreads();
+    if (threadIdx.x < 64) {
+        uint qi = threadIdx.x;
+        uint4* row = reinterpret_cast<uint4*>(p8 + qi * 64);
+        for (int q4 = 0; q4 < 4; q4++)
+            row[q4] = p8r[q4];
     }
     __syncthreads();
 
