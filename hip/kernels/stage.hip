@@ -184,8 +184,10 @@ __global__ void k_vit_attention(const float* qkv, const u8* qkv_f8, u8* out, uin
             }
             __syncthreads();
         }
-        if (threadIdx.x < 16)
+        if (threadIdx.x < 16) {
+#pragma unroll
             for (uint j = 0; j < 32; ++j) denom[threadIdx.x] += ex[threadIdx.x * 33 + j];
+        }
         __syncthreads();
     }
     C32 acc0 = C32::Splat(0.f), acc1 = C32::Splat(0.f);

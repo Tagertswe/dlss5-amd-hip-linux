@@ -65,12 +65,17 @@ struct MatrixB {
             (size_t)(out_col + (threadIdx.x & 15u)) * k_stride + k0 + ((threadIdx.x >> 4u) & 1u) * 8u;
         MatrixB b;
         b.row = true;
+        // One contiguous load per K-half instead of eight scalar gathers.
+        // Size follows DataT (8 B for e4m3, 16 B for f16); element e still
+        // receives memory[e], so the MMA operands are identical.
+        alignas(16) DataT t0[8], t1[8];
+        __builtin_memcpy(t0, base, 8 * sizeof(DataT));
+        __builtin_memcpy(t1, base + 16, 8 * sizeof(DataT));
 #pragma unroll
-        for (uint e = 0; e < 8u; ++e)
-            b.k0r[e] = base[e];
-#pragma unroll
-        for (uint e = 0; e < 8u; ++e)
-            b.k1r[e] = base[e + 16u];
+        for (uint e = 0; e < 8u; ++e) {
+            b.k0r[e] = t0[e];
+            b.k1r[e] = t1[e];
+        }
         return b;
     }
     template <typename Ptr>

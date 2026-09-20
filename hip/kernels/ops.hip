@@ -19,6 +19,8 @@ __global__ void k_linear_f32(const float* input, const u8* input_f8, const u8* w
                              const u8* residual_f8 = nullptr, __half* output_h_raster = nullptr) {
     using namespace linalg;
     const uint first = blockIdx.x * 16, col = blockIdx.y * 64 + (threadIdx.x / 32) * 16;
+    const uint rc_y = threadIdx.x & 15u;
+    const float scale_c = (scales && col < n) ? scales[col + rc_y] : 0.f;
     __shared__ u8 tile[512];
     C32 acc = C32::Splat(0.f);
     if ((F8RES && residual_f8) || (residual && mode != 4))
@@ -33,7 +35,7 @@ __global__ void k_linear_f32(const float* input, const u8* input_f8, const u8* w
                 } else
                     rv = HRID ? __half2float(residual_h[(first + rc.x) * n + col + rc.y])
                               : residual[(first + rc.x) * n + col + rc.y];
-                acc.Set(i, matrix_residual ? rv * scales[col + rc.y] : H(rv * scales[col + rc.y]));
+                acc.Set(i, matrix_residual ? rv * scale_c : H(rv * scale_c));
             }
         }
     C32 partition = C32::Splat(0.f);
@@ -81,7 +83,7 @@ __global__ void k_linear_f32(const float* input, const u8* input_f8, const u8* w
         float v = acc.Get(i);
         if (mode == 4 && residual && first + rc.x < m && col < n)
             v += (HRID ? __half2float(residual_h[(first + rc.x) * n + col + rc.y])
-                       : residual[(first + rc.x) * n + col + rc.y]) * scales[col + rc.y];
+                       : residual[(first + rc.x) * n + col + rc.y]) * scale_c;
         u8 qout = 0;
         if (mode == 2) {
             u8 q = e4m3_byte(ActivatePoly(v));
@@ -184,16 +186,31 @@ __global__ void k_ffn_f32(const float* input, const u8* weights, const float* sc
             }
         }
     } else {
-        for (uint i = threadIdx.x; i < 16 * GROUPS * C; i += blockDim.x) {
-            uint local = i % (16 * C);
-            uint row = first + i / (16 * C) * 16 + local / C;
-            if (F8IN)
-                in[i] = row < tokens ? input_f8[row * C + local % C] : 0;
-            else if (HIN)
-                // The C32 p1 sibling is H(v), exactly representable in f16.
-                in[i] = row < tokens ? e4m3_byte(__half2float(input_h[row * C + local % C])) : 0;
-            else
-                in[i] = row < tokens ? e4m3_byte(input[row * C + local % C]) : 0;
+        const uint count4 = 16 * GROUPS * (C / 4);
+        for (uint i4 = threadIdx.x; i4 < count4; i4 += blockDim.x) {
+            uint local4 = i4 % (16 * (C / 4));
+            uint row = first + (i4 / (16 * (C / 4))) * 16 + local4 / (C / 4);
+            uint ch = (local4 % (C / 4)) * 4;
+            if (F8IN) {
+                uint v = row < tokens ? *reinterpret_cast<const u32*>(input_f8 + row * C + ch) : 0u;
+                *reinterpret_cast<u32*>(in + i4 * 4) = v;
+            } else if (HIN) {
+                const __half2* hp = reinterpret_cast<const __half2*>(input_h + row * C + ch);
+                __half2 h0 = row < tokens ? hp[0] : __half2(0.f, 0.f);
+                __half2 h1 = row < tokens ? hp[1] : __half2(0.f, 0.f);
+                *reinterpret_cast<u32*>(in + i4 * 4) =
+                    u32(e4m3_byte(__half2float(__low2half(h0)))) |
+                    u32(e4m3_byte(__half2float(__high2half(h0)))) << 8 |
+                    u32(e4m3_byte(__half2float(__low2half(h1)))) << 16 |
+                    u32(e4m3_byte(__half2float(__high2half(h1)))) << 24;
+            } else {
+                const float4 v = row < tokens
+                                     ? *reinterpret_cast<const float4*>(input + row * C + ch)
+                                     : make_float4(0.f, 0.f, 0.f, 0.f);
+                *reinterpret_cast<u32*>(in + i4 * 4) =
+                    u32(e4m3_byte(v.x)) | u32(e4m3_byte(v.y)) << 8 |
+                    u32(e4m3_byte(v.z)) << 16 | u32(e4m3_byte(v.w)) << 24;
+            }
         }
     }
     __syncthreads();
@@ -260,17 +277,18 @@ __global__ void k_ffn_f32(const float* input, const u8* weights, const float* sc
     if (group < GROUPS) {
         const uint t0 = group * 16;
         C32 acc = C32::Splat(0.f);
-        if constexpr (C == 32)
+        if constexpr (C == 32) {
+            const float ffn_scale = scales[sub * 16 + (threadIdx.x & 15u)];
             for (uint i = 0; i < acc.Length(); ++i) {
                 uint2 rc = acc.GetCoordinate(i);
                 if (first + t0 + rc.x < tokens) {
                     float iv = HIN
                                    ? __half2float(input_h[(first + t0 + rc.x) * C + sub * 16 + rc.y])
                                    : input[(first + t0 + rc.x) * C + sub * 16 + rc.y];
-                    acc.Set(i, (chain_residual ? from_e4m3(e4m3_byte(iv)) : iv) *
-                               scales[sub * 16 + rc.y]);
+                    acc.Set(i, (chain_residual ? from_e4m3(e4m3_byte(iv)) : iv) * ffn_scale);
                 }
             }
+        }
         for (uint g = 0; g < hidden_c / 32; ++g) {
             A8 a = A8::Load(hidden + t0 * hidden_c, g * 32, hidden_c);
             B8 b = B8::LoadRow(weights, hidden_c * C + (sub * (hidden_c / 32) + g) * 512, 16);
@@ -556,7 +574,11 @@ __global__ void k_post_merge_f32(const float* low,const float* pre,const float* 
 }
 __global__ void k_head_f32(const float* feat,const float* weights,const float* color,float* out,uint n){
  uint p=blockIdx.x*blockDim.x+threadIdx.x;if(p>=n)return;
- for(uint row=0;row<3;++row){float acc=0;for(uint c=0;c<32;++c)acc+=feat[p*32+c]*weights[row*32+c];
+ const float* f=feat+p*32;
+#pragma unroll
+ for(uint row=0;row<3;++row){float acc=0;
+#pragma unroll
+  for(uint c=0;c<32;++c)acc+=f[c]*weights[row*32+c];
   float base=color[p*4+row]*.125f-.0625f;float encoded=H(acc)*.03125f+base;out[p*3+row]=fminf(fmaxf(encoded*8.f+.5f,0.f),1.f);}
 }
 // Per-lane trace reductions avoid atomics and CPU synchronization in the graph.

@@ -77,6 +77,7 @@ DEV float half_square_pair(float lower,float upper){float a=lower*lower,b=H(uppe
  return sum==mid?(error>0?hi:lo):rounded;
 }
 DEV float exp_approx(float x){float a=clampf(H(x*.044921875f+1.30078125f),1.03125f,1.5693359375f);return from_half(((half_bits(a)<<5)+0x8000u)&65535u);}
+DEV float norm_inverse(float x){float r=__builtin_amdgcn_rcpf(x);r=__builtin_fmaf(r,__builtin_fmaf(-x,r,1.f),r);return __builtin_fmaf(r,__builtin_fmaf(-x,r,1.f),r);}
 DEV bool valid_c(uint c){return c==64u||c==128u||c==256u;}
 DEV bool valid_attn(uint c){return valid_c(c)||c==512u;}
 DEV bool valid_spatial(uint c){return c==32u||valid_attn(c);}
@@ -249,7 +250,7 @@ FASTWAVE void mh_scores_exp_fast(const float* normalized,const float* weights,fl
 FASTWAVE void mh_probabilities_fast(const float* ex,float* prob,uint windows,uint channels){
  uint tile=__builtin_amdgcn_workgroup_id_x(),heads=channels/32;if(!valid_attn(channels)||tile>=windows*heads*4)return;uint wh=tile/4,q=tile%4*16,l=__builtin_amdgcn_workitem_id_x(),rc=l&15,g=l>>4;f8 totals[2];
  for(uint side=0;side<2;side++){f8 sum{};for(uint half=0;half<2;half++){h8 a{},b{};for(uint e=0;e<8;e++){uint k=side*16+half*32+g*8+e;a[e]=(_Float16)ex[(wh*64+q+rc)*64+k];b[e]=(_Float16)1.f;}sum=__builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12(a,b,sum);}totals[side]=sum;}
- for(uint e=0;e<8;e++){uint qr=q+g*8+e;float inv=1.f/(totals[0][e]+totals[1][e]);for(uint k=rc;k<64;k+=16)prob[(wh*64+qr)*64+k]=F(ex[(wh*64+qr)*64+k]*inv);}
+ for(uint e=0;e<8;e++){uint qr=q+g*8+e;float inv=norm_inverse(totals[0][e]+totals[1][e]);for(uint k=rc;k<64;k+=16)prob[(wh*64+qr)*64+k]=F(ex[(wh*64+qr)*64+k]*inv);}
 }
 FASTWAVE void mh_attention_av_fast(const float* prob,const float* normalized,float* av,uint width,uint height,uint channels){
  uint tile=__builtin_amdgcn_workgroup_id_x(),heads=channels/32,windows=width/8*(height/8);if(!valid_attn(channels)||width%8||height%8||tile>=windows*heads*8)return;

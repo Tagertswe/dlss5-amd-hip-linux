@@ -69,6 +69,8 @@ void launch_split_f32_hin_f8(const __half* in_h, const u8* pre, const u8* ex, co
                              float* out, u8* out_f8, uint tokens);
 void launch_normalize_qkv(const float* in, const float* scales, u8* out,
                           uint tokens, uint c, float qgain, bool half_squares = true);
+void launch_qkv_norm_half(const float* in, const __half* w, u8* out, uint m, const float* scales,
+                          float qgain);
 void launch_qkv_norm_f32(int c, const float* in, const u8* w, u8* out, uint m,
                          const float* scales, float qgain, bool half_squares);
 void launch_reframe_f32(const float* src, float* dst, uint w, uint h, uint sw, uint sh,

@@ -227,7 +227,7 @@ __global__ void k_stream8(const u8* in, const u8* ffn_w, const u8* proj0_w, cons
                     scores[qi * 64 + j] = e;
                     sum += e;
                 }
-                float inv = 1.f / fmaxf(sum, 1e-20f);
+                float inv = norm_inverse(fmaxf(sum, 1e-20f));
                 for (int j = 0; j < 64; j++)
                     scores[qi * 64 + j] = F(H(scores[qi * 64 + j] * inv));
             }
@@ -441,7 +441,7 @@ __global__ void k_fused_swin(const u8* in, const u8* ffn_w, const u8* qkv_w, con
                     scores[qi * 64 + j] = e;
                     sum += e;
                 }
-                float inv = 1.f / fmaxf(sum, 1e-20f);
+                float inv = norm_inverse(fmaxf(sum, 1e-20f));
                 for (int j = 0; j < 64; j++)
                     scores[qi * 64 + j] = F(H(scores[qi * 64 + j] * inv));
             }
@@ -680,7 +680,7 @@ __global__ void k_fused_attn_proj(const u8* qkv, const float* bias, const u8* pr
                     scores[qi * 64 + j] = e;
                     sum += e;
                 }
-                float inv = 1.f / fmaxf(sum, 1e-20f);
+                float inv = norm_inverse(fmaxf(sum, 1e-20f));
                 for (int j = 0; j < 64; j++)
                     scores[qi * 64 + j] = F(H(scores[qi * 64 + j] * inv));
             }

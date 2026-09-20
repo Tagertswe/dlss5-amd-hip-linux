@@ -105,6 +105,12 @@ void launch_normalize_qkv(const float* in, const float* scales, u8* out,
     LAUNCH(k_normalize_qkv, (count + 255) / 256, 256, in, scales, out, tokens, c, qgain, half_squares);
 }
 
+void launch_qkv_norm_half(const float* in, const __half* w, u8* out, uint m, const float* scales,
+                          float qgain) {
+    if (!m || !in || !w || !out || !scales) throw std::runtime_error("ViT QKV extent/scales");
+    LAUNCH(k_vit_qkv_norm, dim3((m + 15) / 16, 96u), 64, in, w, out, m, scales, qgain);
+}
+
 // GEMM + normalize + quantize in one launch (bit-identical to the split pair).
 void launch_qkv_norm_f32(int c, const float* in, const u8* w, u8* out, uint m,
                          const float* scales, float qgain, bool half_squares) {

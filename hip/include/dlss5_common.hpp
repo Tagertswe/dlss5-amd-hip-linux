@@ -95,6 +95,20 @@ __host__ __device__ inline float ActivatePoly(float v) {
 }
 __host__ __device__ inline float Activate(float v) { return F(ActivatePoly(v)); }
 
+// v_rcp_f32 + two Newton–Raphson FMAs. Exhaustive gfx1201 check: every finite
+// divisor in [1/256, 624] matches IEEE 1.f/x (144 441 345 values). Window
+// softmax sums 64 positive half exponents into that interval, so replacing
+// 1.f/sum is bit-identical. Do not use for ViT (640-key sums can exceed 624).
+__host__ __device__ inline float norm_inverse(float x) {
+#if defined(__HIP_DEVICE_COMPILE__)
+    float r = __builtin_amdgcn_rcpf(x);
+    r = __builtin_fmaf(r, __builtin_fmaf(-x, r, 1.f), r);
+    return __builtin_fmaf(r, __builtin_fmaf(-x, r, 1.f), r);
+#else
+    return 1.f / x;
+#endif
+}
+
 // native_c32_ffn_fused.hlsli precise q/p: no multiply-add contraction.
 // Keep the legacy polynomial for other shader families and public operators.
 __host__ __device__ inline float ActivatePolyC32(float v) {

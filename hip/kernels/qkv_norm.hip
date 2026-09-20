@@ -158,4 +158,90 @@ __global__ void k_qkv_norm_f32(const float* input, const u8* input_f8, const u8*
     }
 }
 
+// Fused ViT QKV (f16 weights, raw f32 acc) + per-head RMS + E4M3.
+// Bit-identical to launch_linear_half_out(..., 640, 3072, 1024, 1, 0, 2)
+// followed by launch_normalize_qkv(..., 1024, 5.65625f): same K order, same
+// f32→f16 input casts, same serial 32-channel square sum, same V path (no RMS).
+__global__ void __launch_bounds__(64) k_vit_qkv_norm(const float* input, const __half* weights,
+                                                     u8* output, uint m, const float* scales,
+                                                     float qgain) {
+    using namespace linalg;
+    constexpr uint K = 1024u, N = 3072u, HEADS = 32u;
+    const uint first = blockIdx.x * 16u;
+    const uint head0 = blockIdx.y;
+    const uint part = head0 / HEADS;
+    const uint head = head0 % HEADS;
+    const uint wave = threadIdx.x / 32u;
+    const uint col = head0 * 32u + wave * 16u;
+    __shared__ float stage[16 * 32];
+    __half* tile = reinterpret_cast<__half*>(stage);
+    C32 acc = C32::Splat(0.f);
+    for (uint g = 0; g < K / 32u; ++g) {
+        const uint c4 = (threadIdx.x % 8u) * 4u;
+        for (uint rlocal = threadIdx.x / 8u; rlocal < 16u; rlocal += blockDim.x / 8u) {
+            const uint row = first + rlocal;
+            const float4 v = row < m
+                ? *reinterpret_cast<const float4*>(input + row * K + g * 32u + c4)
+                : make_float4(0.f, 0.f, 0.f, 0.f);
+            const __half h0 = __float2half(v.x), h1 = __float2half(v.y);
+            const __half h2 = __float2half(v.z), h3 = __float2half(v.w);
+            *reinterpret_cast<uint2*>(tile + rlocal * 32u + c4) =
+                uint2(u32(__half_as_ushort(h0)) | u32(__half_as_ushort(h1)) << 16,
+                      u32(__half_as_ushort(h2)) | u32(__half_as_ushort(h3)) << 16);
+        }
+        __syncthreads();
+        A16 a = A16::Load(tile, 0, 64);
+        B16 b = B16::LoadRowMajorOut(weights, col, g * 32u, K);
+        acc.MultiplyAccumulate(a, b);
+        __syncthreads();
+    }
+    if (part < 2u) {
+        acc.StoreF32(stage, wave * 16u * 4u, 32u * 4u);
+        __syncthreads();
+        if (threadIdx.x < 16u) {
+            const uint row = threadIdx.x;
+            const float* s0 = &stage[row * 32u];
+            const float* s1 = s0 + 16u;
+            float sum = 0.f;
+            const float4* q0 = reinterpret_cast<const float4*>(s0);
+            const float4* q1 = reinterpret_cast<const float4*>(s1);
+#pragma unroll
+            for (uint q = 0; q < 4u; ++q) {
+                float4 a = q0[q];
+                sum += sq_half_f32(a.x);
+                sum += sq_half_f32(a.y);
+                sum += sq_half_f32(a.z);
+                sum += sq_half_f32(a.w);
+            }
+#pragma unroll
+            for (uint q = 0; q < 4u; ++q) {
+                float4 b = q1[q];
+                sum += sq_half_f32(b.x);
+                sum += sq_half_f32(b.y);
+                sum += sq_half_f32(b.z);
+                sum += sq_half_f32(b.w);
+            }
+            float inv = rsqrtf(fmaxf(sum, 6.198883056640625e-5f));
+            if (part == 0u)
+                inv *= scales[head] * qgain;
+            u32 w[8] = {0, 0, 0, 0, 0, 0, 0, 0};
+            for (uint ch = 0; ch < 16u; ++ch)
+                w[ch >> 2] |= u32(e4m3_byte(s0[ch] * inv)) << ((ch & 3u) * 8u);
+            for (uint ch = 0; ch < 16u; ++ch)
+                w[4u + (ch >> 2)] |= u32(e4m3_byte(s1[ch] * inv)) << ((ch & 3u) * 8u);
+            u8* out = output + (size_t)(first + row) * N + part * K + head * 32u;
+            uint4* o4 = reinterpret_cast<uint4*>(out);
+            o4[0] = make_uint4(w[0], w[1], w[2], w[3]);
+            o4[1] = make_uint4(w[4], w[5], w[6], w[7]);
+        }
+    } else {
+        u8* out = output + (size_t)first * N + part * K + head * 32u + wave * 16u;
+        for (uint i = 0; i < acc.Length(); ++i) {
+            uint2 rc = acc.GetCoordinate(i);
+            if (first + rc.x < m)
+                out[(size_t)rc.x * N + rc.y] = e4m3_byte(acc.Get(i));
+        }
+    }
+}
+
 } // namespace dlss5

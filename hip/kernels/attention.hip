@@ -42,11 +42,13 @@ __global__ void __launch_bounds__(128, 7) k_window_attention(const u8* qkv, cons
     for (uint window = blockIdx.x; window < nwin; window += gridDim.x) {
 
     A8 q = A8::Load(qkv, (window * 64u + qtok) * uint(STRIDE) + head * 32u, uint(STRIDE));
+#pragma unroll
     for (uint k0 = 0; k0 < 64; k0 += 16) {
         B8 k = B8::LoadCol(qkv, (window * 64u + k0) * uint(STRIDE) + uint(C) + head * 32u,
                            uint(STRIDE));
         C32 s = Multiply(q, k);
-        for (uint i = 0; i < s.Length(); i++) {
+#pragma unroll
+        for (uint i = 0; i < 8u; i++) {
             uint2 rc = s.GetCoordinate(i);
             uint qi = qtok + rc.x, kj = k0 + rc.y;
             scores[qi * 68 + kj] = __float2half_rn(
@@ -61,6 +63,7 @@ __global__ void __launch_bounds__(128, 7) k_window_attention(const u8* qkv, cons
         float sum = 0.f;
         // 16 x 8B loads (4 f16 each); 136B row stride keeps 8B alignment and the
         // per-step banks 2-way. Serial f32 order 0..63 is preserved.
+#pragma unroll
         for (int j = 0; j < 16; j++) {
             uint2 v = *reinterpret_cast<const uint2*>(&scores[qi * 68 + j * 4]);
             const __half2* h = reinterpret_cast<const __half2*>(&v);
@@ -69,13 +72,15 @@ __global__ void __launch_bounds__(128, 7) k_window_attention(const u8* qkv, cons
             sum += __half2float(__low2half(h[1]));
             sum += __half2float(__high2half(h[1]));
         }
-        float inv = 1.f / fmaxf(sum, 1e-20f);
+        float inv = norm_inverse(fmaxf(sum, 1e-20f));
         // Quantize into registers first: p8 aliases scores, so the LDS write is
         // deferred past a barrier until every scores read above is complete.
         // 4 x 16B (16 E4M3 bytes); rows 16B-aligned, banks 8-way instead of 32-way.
+#pragma unroll
         for (int q4 = 0; q4 < 4; q4++) {
             uint4 v;
             u8* b = reinterpret_cast<u8*>(&v);
+#pragma unroll
             for (int t = 0; t < 16; t++)
                 b[t] = e4m3_byte(__half2float(scores[qi * 68 + q4 * 16 + t]) * inv);
             p8r[q4] = v;

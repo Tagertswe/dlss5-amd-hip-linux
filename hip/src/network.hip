@@ -144,7 +144,8 @@ struct Block {
                         write_f32_out);
        return;
       }
-      if((c==64||c==128||c==256) && std::getenv("DLSS5_MH_PROD") && std::string(std::getenv("DLSS5_MH_PROD"))=="1"){
+      const char* mh_prod = std::getenv("DLSS5_MH_PROD");
+      if((c==64||c==128||c==256) && (in_h||in_f8) && (!mh_prod || std::string(mh_prod)!="0")){
         const uint n2=sw*sh;
          unsigned char* dbg_hidden=nullptr,*dbg_d=nullptr;
          {const char* ds0=getenv("DLSS5_DUMP_SCRATCH");if(ds0&&c==64&&id==atoi(ds0)&&in_h){hip_check(hipMalloc(&dbg_hidden,size_t(n2)*4*c),"dbg_h");hip_check(hipMalloc(&dbg_d,size_t(n2)*c),"dbg_d");}}
@@ -256,11 +257,9 @@ struct Vit {
   void run(const float* in,float* out,Scratch&s){
    // The expand output is already on the E4M3 grid; keeping the bytes lets the
    // contract GEMM consume them directly (e4m3_byte(from_e4m3(q)) == q).
-   launch_linear_f32_f8out(in,ex.as<u8>(),s.hidden.as<float>(),s.hidden8.as<u8>(),640,4096,1024,nullptr,nullptr,2,0);
+   launch_linear_f32_f8out(in,ex.as<u8>(),nullptr,s.hidden8.as<u8>(),640,4096,1024,nullptr,nullptr,2,0);
    launch_linear_f32_f8in(s.hidden8.as<u8>(),ct.as<u8>(),s.b.as<float>(),640,1024,4096,in,cs.as<float>(),1,2);
-  // QKV fast fused uses genuine F16 weights, raw FP32 dot before normalization.
-  launch_linear_half_out(s.b.as<float>(),qw.as<__half>(),s.q.as<float>(),640,3072,1024,1,0,2);
-  launch_normalize_qkv(s.q.as<float>(),qs.as<float>(),s.q8.as<u8>(),640,1024,5.65625f);
+  launch_qkv_norm_half(s.b.as<float>(),qw.as<__half>(),s.q8.as<u8>(),640,qs.as<float>(),5.65625f);
    // The normalized QKV is already on the E4M3 grid, so attention can consume
    // the bytes directly; the f8 -> f32 round trip and re-quantize are redundant.
    launch_vit_attention_f8(s.q8.as<u8>(),s.att8.as<u8>(),640,1024);

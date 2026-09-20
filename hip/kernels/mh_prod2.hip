@@ -68,6 +68,7 @@ DEV uint bid(){return __builtin_amdgcn_workgroup_id_x();}
 #ifndef HIP_MH_RTZ_ISA
 #define HIP_MH_RTZ_ISA 1 /* 2026-09-17: -0.02 alone, -0.16 with HIP_BRANCHLESS_Q8, bit-exact. Hrtz via v_cvt_pkrtz_f16_f32 (the C32/deep/padded files' production form) instead of the software bit path, which the ISA showed as a 4-deep nest of divergent branches per output element (32 instances per projection epilogue) */
 #endif
+DEV float norm_inverse(float x){float r=__builtin_amdgcn_rcpf(x);r=__builtin_fmaf(r,__builtin_fmaf(-x,r,1.f),r);return __builtin_fmaf(r,__builtin_fmaf(-x,r,1.f),r);}
 #if HIP_MH_RTZ_ISA
 DEV float Hrtz(float x){uint h;float r;asm("v_cvt_pkrtz_f16_f32 %0, %1, %1" : "=v"(h) : "v"(x));asm("v_cvt_f32_f16 %0, %1" : "=v"(r) : "v"(h));return r;}
 #else
@@ -116,7 +117,7 @@ void mh_attention_fused(const float*normalized,const float*w,float*out,uint widt
   if(tid<64){float sum=0.f;const uint*rowu=reinterpret_cast<const uint*>(ex+tid*66);
    #pragma unroll
    for(uint j=0;j<32;j++){uint v=rowu[j];sum+=float(__builtin_bit_cast(_Float16,(ushort)(v&0xffffu)));sum+=float(__builtin_bit_cast(_Float16,(ushort)(v>>16)));}
-   rowinv[tid]=1.f/maxf(sum,1e-20f);}
+   rowinv[tid]=norm_inverse(maxf(sum,1e-20f));}
   sync_window();
  // Q/K are dead; probability64x68 occupies4352 of their4608 bytes. V starts4608.
  for(uint key=0;key<64;key+=16)for(uint e=0;e<8;e++){uint row=first+gr()*8+e,k=key+rc();float inv=rowinv[row];packed[row*68+k]=static_cast<unsigned char>(fp8(float(ex[row*66+k])*inv));}
@@ -152,7 +153,7 @@ void mh_attention_fused_fp8(const unsigned char*normalized,const float*w,float*o
   if(tid<64){float sum=0.f;const uint*rowu=reinterpret_cast<const uint*>(ex+tid*66);
    #pragma unroll
    for(uint j=0;j<32;j++){uint v=rowu[j];sum+=float(__builtin_bit_cast(_Float16,(ushort)(v&0xffffu)));sum+=float(__builtin_bit_cast(_Float16,(ushort)(v>>16)));}
-   rowinv[tid]=1.f/maxf(sum,1e-20f);}
+   rowinv[tid]=norm_inverse(maxf(sum,1e-20f));}
   sync_window();
  // Q/K are dead; probability64x68 occupies4352 of their4608 bytes. V starts4608.
  for(uint key=0;key<64;key+=16)for(uint e=0;e<8;e++){uint row=first+gr()*8+e,k=key+rc();float inv=rowinv[row];packed[row*68+k]=static_cast<unsigned char>(fp8(float(ex[row*66+k])*inv));}
@@ -188,7 +189,7 @@ void mh_attention_fused_fp8_out(const unsigned char*normalized,const float*w,uns
   if(tid<64){float sum=0.f;const uint*rowu=reinterpret_cast<const uint*>(ex+tid*66);
    #pragma unroll
    for(uint j=0;j<32;j++){uint v=rowu[j];sum+=float(__builtin_bit_cast(_Float16,(ushort)(v&0xffffu)));sum+=float(__builtin_bit_cast(_Float16,(ushort)(v>>16)));}
-   rowinv[tid]=1.f/maxf(sum,1e-20f);}
+   rowinv[tid]=norm_inverse(maxf(sum,1e-20f));}
   sync_window();
  // Q/K are dead; probability64x68 occupies4352 of their4608 bytes. V starts4608.
  for(uint key=0;key<64;key+=16)for(uint e=0;e<8;e++){uint row=first+gr()*8+e,k=key+rc();float inv=rowinv[row];packed[row*68+k]=static_cast<unsigned char>(fp8(float(ex[row*66+k])*inv));}
@@ -230,7 +231,7 @@ DEV void c64_attention_project_body(const unsigned char*normalized,const float*w
   if(tid<64){float sum=0.f;const uint*rowu=reinterpret_cast<const uint*>(ex+tid*66);
    #pragma unroll
    for(uint j=0;j<32;j++){uint v=rowu[j];sum+=float(__builtin_bit_cast(_Float16,(ushort)(v&0xffffu)));sum+=float(__builtin_bit_cast(_Float16,(ushort)(v>>16)));}
-   rowinv[head*64+tid]=1.f/maxf(sum,1e-20f);}
+   rowinv[head*64+tid]=norm_inverse(maxf(sum,1e-20f));}
   sync_window();
  uint pv[8]{};
  #pragma unroll
@@ -293,7 +294,7 @@ void c64_attention_project_w16(const unsigned char*normalized,const float*w,cons
   if(t<64){float sum=0.f;const uint*rowu=reinterpret_cast<const uint*>(ex+t*66);
    #pragma unroll
    for(uint j=0;j<32;j++){uint v=rowu[j];sum+=float(__builtin_bit_cast(_Float16,(ushort)(v&0xffffu)));sum+=float(__builtin_bit_cast(_Float16,(ushort)(v>>16)));}
-   psum[t]=1.f/maxf(sum,1e-20f);}
+   psum[t]=norm_inverse(maxf(sum,1e-20f));}
   sync_window();
  uint pv[8]{};
  #pragma unroll
@@ -361,7 +362,7 @@ DEV void c128_attention_project_body(const unsigned char*normalized,const float*
   if(tid<64){float sum=0.f;const uint*rowu=reinterpret_cast<const uint*>(ex+tid*66);
    #pragma unroll
    for(uint j=0;j<32;j++){uint v=rowu[j];sum+=float(__builtin_bit_cast(_Float16,(ushort)(v&0xffffu)));sum+=float(__builtin_bit_cast(_Float16,(ushort)(v>>16)));}
-   rowinv[head*64+tid]=1.f/maxf(sum,1e-20f);}
+   rowinv[head*64+tid]=norm_inverse(maxf(sum,1e-20f));}
   sync_window();
  uint pv[8]{};
  #pragma unroll
@@ -434,7 +435,7 @@ DEV void c256_attention_project_body(const unsigned char*normalized,const float*
   if(tid<64){float sum=0.f;const uint*rowu=reinterpret_cast<const uint*>(ex+tid*66);
    #pragma unroll
    for(uint j=0;j<32;j++){uint v=rowu[j];sum+=float(__builtin_bit_cast(_Float16,(ushort)(v&0xffffu)));sum+=float(__builtin_bit_cast(_Float16,(ushort)(v>>16)));}
-   rowinv[head*64+tid]=1.f/maxf(sum,1e-20f);}
+   rowinv[head*64+tid]=norm_inverse(maxf(sum,1e-20f));}
   sync_window();
  uint pv[8]{};
  #pragma unroll
