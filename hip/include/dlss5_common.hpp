@@ -126,9 +126,15 @@ __host__ __device__ inline float ActivatePolyC32(float v) {
 // stays as the non-finite fallback.
 __host__ __device__ inline u8 e4m3_byte(float v) {
 #if defined(__HIP_DEVICE_COMPILE__)
-    if ((as_u32(v) & 0x7fffffffu) < 0x7f800000u)
-        return u8(__builtin_amdgcn_cvt_pk_fp8_f32(__builtin_amdgcn_fmed3f(v, 448.f, -448.f), 0.f, 0, false) & 0xffu);
-#endif
+    // Branchless for finite + Inf: the +/-448 clamp maps +/-Inf to the finite max, so
+    // the hardware cvt is bit-identical to the software recipe for finite and Inf
+    // inputs (verified in test_e4m3_hw.hip). NaN is selected to the E4M3 NaN code via
+    // a cndmask (no divergent branch); production values are finite so the select is
+    // uniform. This drops the old finiteness branch + the dead software path per call.
+    u32 bits = as_u32(v);
+    u8 hw = u8(__builtin_amdgcn_cvt_pk_fp8_f32(__builtin_amdgcn_fmed3f(v, 448.f, -448.f), 0.f, 0, false) & 0xffu);
+    return ((bits & 0x7fffffffu) > 0x7f800000u) ? u8(0x7f | (bits & 0x80u)) : hw;
+#else
     u32 b = as_u32(v), a = b & 0x7fffffffu;
     u8 sg = u8((b >> 24) & 0x80u);
     if (a > 0x7f800000u)
@@ -140,6 +146,7 @@ __host__ __device__ inline u8 e4m3_byte(float v) {
     u32 rounded = (a + 0x7ffffu + ((a >> 20) & 1u)) & 0xfff00000u;
     u32 code = ((rounded >> 23) - 120u) * 8u + ((rounded >> 20) & 7u);
     return u8(sg | (code > 126u ? 126u : code));
+#endif
 }
 
 __host__ __device__ inline float from_e4m3(u8 b) {
