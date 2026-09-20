@@ -31,7 +31,7 @@ void launch_ffn_f32(int c, const float* in, const u8* w, const float* scales, fl
     if (!tokens || in == out || (c == 32 && !scales)) throw std::runtime_error("FFN extent/alias/scales");
     uint groups = (tokens + 15) / 16;
     switch (c) {
-    case 32: LAUNCH((k_ffn_f32<32, false, 2>), (tokens + 31) / 32, 128, in, w, scales, out, nullptr,
+    case 32: LAUNCH((k_ffn_f32<32, false, 1>), (tokens + 15) / 16, 64, in, w, scales, out, nullptr,
                     tokens, chain_residual, precise_c32); break;
     case 64: LAUNCH((k_ffn_f32<64, false>), groups, 128, in, w, scales, out, nullptr, tokens); break;
     case 128: LAUNCH((k_ffn_f32<128, false>), groups, 256, in, w, scales, out, nullptr, tokens); break;
@@ -43,14 +43,14 @@ void launch_ffn_f32_hout(int c, const float* in, const u8* w, const float* scale
                           uint tokens, bool chain_residual, bool precise_c32) {
     if (!tokens || c != 32 || !scales || !out_h)
         throw std::runtime_error("FFN f16 extent/alias");
-    LAUNCH((k_ffn_f32<32, false, 2, true>), (tokens + 31) / 32, 128, in, w, scales, nullptr,
+    LAUNCH((k_ffn_f32<32, false, 1, true>), (tokens + 15) / 16, 64, in, w, scales, nullptr,
            nullptr, tokens, chain_residual, precise_c32, out_h);
 }
 void launch_ffn_f32_hin_hout(int c, const __half* in_h, const u8* w, const float* scales,
                              __half* out_h, uint tokens, bool chain_residual, bool precise_c32) {
     if (!tokens || c != 32 || !in_h || !scales || !out_h)
         throw std::runtime_error("FFN f16 in extent/alias");
-    LAUNCH((k_ffn_f32<32, false, 2, true, false, true>), (tokens + 31) / 32, 128, nullptr, w,
+    LAUNCH((k_ffn_f32<32, false, 1, true, false, true>), (tokens + 15) / 16, 64, nullptr, w,
            scales, nullptr, nullptr, tokens, chain_residual, precise_c32, out_h, nullptr, in_h);
 }
 void launch_ffn_f32_f8(int c, const float* in, const u8* w, const float* scales, float* out_f32,
