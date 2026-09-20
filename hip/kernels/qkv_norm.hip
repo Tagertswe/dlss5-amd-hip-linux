@@ -46,7 +46,9 @@ __global__ void k_qkv_norm_f32(const float* input, const u8* input_f8, const u8*
     // stage buffer. The tile is only read inside the K loop; stage is only
     // written after it (with a barrier between), so the aliasing is safe.
     // Cuts LDS 512+16*COLS*4 -> 16*COLS*4 (e.g. C32/NH1 2560B->2048B).
-    constexpr uint STAGE_COLS = VONLY ? 128u : (C == 32 && NH == 3) ? 64u : COLS;
+    // 66 (not 64) floats/row: the 16 ds_load_b128 norm reads stride 264 B (2 words
+    // per row) so the 16 rows hit distinct LDS bank sets instead of 8-way conflicts.
+    constexpr uint STAGE_COLS = VONLY ? 128u : (C == 32 && NH == 3) ? 66u : COLS;
     __shared__ float stage[16 * STAGE_COLS];
     u8* tile = reinterpret_cast<u8*>(stage);
     C32 acc = C32::Splat(0.f);
